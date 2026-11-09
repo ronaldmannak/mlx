@@ -315,6 +315,60 @@ void gpu_merge_sort(
   }
 }
 
+void argpartition_edge(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    array& out,
+    int edge_size,
+    bool upper) {
+  constexpr int threads = 512;
+  constexpr int tile_size = threads * 4;
+  int width = in.shape(-1);
+  int rows = in.size() / width;
+  int tiles = (width - 1) / tile_size + 1;
+  int last_tile_size = width - (tiles - 1) * tile_size;
+  uint32_t select_upper = upper;
+  int candidate_width =
+      (tiles - 1) * edge_size + std::min(edge_size, last_tile_size);
+
+  array candidates({rows, candidate_width}, in.dtype(), nullptr, {});
+  array indices({rows, candidate_width}, uint32, nullptr, {});
+  array order({rows, candidate_width}, uint32, nullptr, {});
+  candidates.set_data(allocator::malloc(candidates.nbytes()));
+  indices.set_data(allocator::malloc(indices.nbytes()));
+  order.set_data(allocator::malloc(order.nbytes()));
+
+  auto& encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel("argpartition_candidates_" + type_to_name(in));
+  encoder.set_compute_pipeline_state(kernel);
+  encoder.set_input_array(in, 0);
+  encoder.set_output_array(candidates, 1);
+  encoder.set_output_array(indices, 2);
+  encoder.set_output_array(out, 3);
+  encoder.set_bytes(width, 4);
+  encoder.set_bytes(candidate_width, 5);
+  encoder.set_bytes(edge_size, 6);
+  encoder.set_bytes(select_upper, 7);
+  encoder.dispatch_threadgroups(
+      MTL::Size(tiles, rows, 1), MTL::Size(threads, 1, 1));
+
+  // The requested edge can only contain elements in an edge of a tile.
+  gpu_merge_sort(s, d, candidates, order, 1, true);
+
+  encoder.set_compute_pipeline_state(d.get_kernel("argpartition_permute"));
+  encoder.set_input_array(indices, 0);
+  encoder.set_input_array(order, 1);
+  encoder.set_output_array(out, 2);
+  encoder.set_bytes(width, 3);
+  encoder.set_bytes(candidate_width, 4);
+  encoder.set_bytes(edge_size, 5);
+  encoder.set_bytes(select_upper, 6);
+  encoder.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(64, 1, 1));
+  encoder.add_temporaries(
+      {std::move(candidates), std::move(indices), std::move(order)});
+}
+
 } // namespace
 
 void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -342,7 +396,6 @@ void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // We direct arg partition to sort for now
   assert(inputs.size() == 1);
 
   out.set_data(allocator::malloc(out.nbytes()));
@@ -350,6 +403,17 @@ void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
   auto& in = inputs[0];
+
+  int width = in.shape(axis_);
+  int lower_size = kth_ + 1;
+  int upper_size = width - kth_;
+  int edge_size = std::min(lower_size, upper_size);
+  if (axis_ == in.ndim() - 1 && in.flags().row_contiguous && width >= 16384 &&
+      edge_size <= 64 && in.size() > 0 && in.size() <= INT32_MAX &&
+      (in.dtype() == float32 || in.dtype() == float16 ||
+       in.dtype() == bfloat16)) {
+    return argpartition_edge(s, d, in, out, edge_size, upper_size < lower_size);
+  }
 
   gpu_merge_sort(s, d, in, out, axis_, true);
 }
