@@ -3268,6 +3268,36 @@ class TestOps(mlx_tests.MLXTestCase):
         expected = mx.array([[0, 0], [1, 1]])
         self.assertTrue(mx.array_equal(out, expected))
 
+    def test_argpartition_metal_edges(self):
+        if not self.is_apple_silicon or not mx.metal.is_available():
+            self.skipTest("requires Metal")
+
+        width = 131073
+        rng = np.random.default_rng(0)
+        x = rng.integers(-8, 9, size=(3, width)).astype(np.float32)
+        x[0, :100] = -np.inf
+        x[0, 2048:2148] = np.inf
+        x[0, -4:] = np.nan
+        x[1, :] = np.nan
+        x[2, 1::2] = -0.0
+
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            data = mx.array(x).astype(dtype)
+            sorted_indices = np.array(mx.argsort(data, axis=-1, stream=mx.gpu))
+            expected_indices = np.broadcast_to(np.arange(width), x.shape)
+            for kth in (0, 39, 63, -64, -32, -1):
+                with self.subTest(dtype=dtype, kth=kth):
+                    indices = mx.argpartition(data, kth, axis=-1, stream=mx.gpu)
+                    self.assertEqual(indices.dtype, mx.uint32)
+                    indices = np.array(indices)
+                    np.testing.assert_array_equal(
+                        np.sort(indices, axis=-1), expected_indices
+                    )
+                    edge = slice(kth, None) if kth < 0 else slice(0, kth + 1)
+                    np.testing.assert_array_equal(
+                        indices[:, edge], sorted_indices[:, edge]
+                    )
+
     def test_searchsorted(self):
         def expect(out, want):
             self.assertTrue(mx.array_equal(out, mx.array(want)), f"got {out}")
