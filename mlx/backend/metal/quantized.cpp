@@ -10,6 +10,7 @@
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/unary.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/config.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
@@ -541,7 +542,8 @@ void qmv(
 
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
 inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
-  return mode != "affine" || d.get_architecture_gen() >= 15;
+  return (mode != "affine" || d.get_architecture_gen() >= 15) &&
+      !config::get("MLX_DISABLE_QMV_WIDE", 0);
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -2172,7 +2174,7 @@ void dispatch_qmv(
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+  if (M >= 2 && !global_scale && use_qmv_wide(mode, d)) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }

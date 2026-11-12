@@ -1407,6 +1407,26 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), tol)
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_metal_disable_qmv_wide_matches_singleton_rows(self):
+        # These dimensions select qmv_wide on gen 15+ with the default config.
+        with mx.config.scoped_update(MLX_DISABLE_QMV_WIDE=1):
+            for dtype, seed in [(mx.bfloat16, 2), (mx.float32, 0)]:
+                with self.subTest(dtype=dtype):
+                    key_w, key_x = mx.random.split(mx.random.key(seed))
+                    w = mx.random.normal((512, 1024), key=key_w).astype(dtype)
+                    x = mx.random.normal((3, 1024), key=key_x).astype(dtype)
+                    weights = mx.quantize(w, group_size=64, bits=4)
+
+                    def project(rows):
+                        return mx.quantized_matmul(
+                            rows, *weights, group_size=64, bits=4, stream=mx.gpu
+                        )
+
+                    batched = project(x)
+                    singletons = mx.concatenate([project(row[None, :]) for row in x])
+                    self.assertTrue(mx.array_equal(batched, singletons).item())
+
     def test_qvm(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)

@@ -114,6 +114,13 @@ Metal
    Enable the faster Metal CPU/GPU synchronization path. The default is ``0``.
    This requires Metal 3.2 or later (macOS 15 or later, or iOS 18 or later).
 
+.. envvar:: MLX_DISABLE_QMV_WIDE
+
+   Set to ``1`` to route small batches of quantized vector products eligible
+   for the Metal ``qmv_wide`` kernel through ``qmv``. This uses the same kernel
+   as a single row for those shapes and may reduce throughput. The default is
+   ``0``.
+
 .. envvar:: MLX_CONV_WINOGRAD
 
    Allow the Winograd algorithm for 3x3 ``conv2d``. The default is ``1``. Set
