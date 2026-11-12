@@ -266,60 +266,47 @@ void init_fast(nb::module_& parent_module) {
          const std::variant<std::monostate, std::string, mx::array>& mask,
          const std::optional<mx::array>& sinks,
          bool force_fused,
+         const std::optional<mx::array>& left_padding,
          mx::StreamOrDevice s) {
-        bool has_mask = !std::holds_alternative<std::monostate>(mask);
-        bool has_str_mask =
-            has_mask && std::holds_alternative<std::string>(mask);
-        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
-
-        if (has_mask) {
-          if (has_str_mask) {
-            auto mask_str = std::get<std::string>(mask);
-            if (mask_str != "causal") {
-              std::ostringstream msg;
-              msg << "[scaled_dot_product_attention] invalid mask option '"
-                  << mask_str << "'. Must be 'causal', or an array.";
-              throw std::invalid_argument(msg.str());
-            }
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                mask_str,
-                std::nullopt,
-                sinks,
-                force_fused,
-                s);
-          } else {
-            auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                "",
-                mask_arr,
-                sinks,
-                force_fused,
-                s);
+        std::string mask_mode;
+        std::optional<mx::array> mask_arr;
+        if (const auto* mode = std::get_if<std::string>(&mask)) {
+          if (*mode != "causal") {
+            std::ostringstream msg;
+            msg << "[scaled_dot_product_attention] invalid mask option '"
+                << *mode << "'. Must be 'causal', or an array.";
+            throw std::invalid_argument(msg.str());
           }
+          mask_mode = *mode;
+        } else if (const auto* arr = std::get_if<mx::array>(&mask)) {
+          mask_arr = *arr;
+        }
 
-        } else {
+        if (left_padding) {
           return mx::fast::scaled_dot_product_attention(
               queries,
               keys,
               values,
               scale,
               window_size,
-              "",
-              {},
+              mask_mode,
+              mask_arr,
               sinks,
               force_fused,
+              *left_padding,
               s);
         }
+        return mx::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            window_size,
+            mask_mode,
+            mask_arr,
+            sinks,
+            force_fused,
+            s);
       },
       "q"_a,
       "k"_a,
@@ -330,9 +317,10 @@ void init_fast(nb::module_& parent_module) {
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
       "force_fused"_a = false,
+      "left_padding"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, left_padding: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -375,6 +363,13 @@ void init_fast(nb::module_& parent_module) {
                type must promote to the promoted type of ``q``, ``k``, and ``v``.
                The ``"causal"`` mask uses lower-right alignment where the
                last query aligns with the last key.
+            left_padding (array, optional): An int32 array of shape ``[B]``
+               containing the number of leading padded keys and values in each
+               row. Each row must have at least one unpadded key. Cannot be
+               combined with ``mask``, ``window_size``, or ``sinks`` and
+               is unavailable in shapeless tracing.
+               Supported Metal decode shapes skip these positions before
+               loading keys and values. Other shapes use a boolean mask.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
             force_fused (bool, optional): If ``True``, use a fused kernel

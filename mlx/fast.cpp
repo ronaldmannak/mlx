@@ -2,6 +2,7 @@
 #include <cassert>
 #include <numeric>
 
+#include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -711,17 +712,18 @@ bool RoPE::is_equivalent(const Primitive& other) const {
 }
 
 /** Computes: O = softmax(Q @ K.T) @ V **/
-array scaled_dot_product_attention(
+static array scaled_dot_product_attention_impl(
     const array& queries,
     const array& keys,
     const array& values,
     const float scale,
-    int window_size /* = -1 */,
-    const std::string& mask_mode /* = "" */,
-    std::optional<array> mask_arr /* = {} */,
-    const std::optional<array>& sinks /* = {} */,
-    bool force_fused /* = false */,
-    StreamOrDevice s /* = {} */) {
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const std::optional<array>& left_padding,
+    StreamOrDevice s) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -737,6 +739,34 @@ array scaled_dot_product_attention(
     throw std::invalid_argument(msg.str());
   }
   bool has_window = window_size > 0;
+
+  if (left_padding) {
+    if (detail::in_dynamic_tracing()) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding does not support "
+          "shapeless tracing.");
+    }
+    if (!mask_mode.empty() || mask_arr || has_window || sinks) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding cannot be combined "
+          "with a mask, window, or sinks.");
+    }
+    if (left_padding->dtype() != int32 ||
+        left_padding->shape() != Shape{queries.shape(0)}) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding must be an int32 "
+          "array of shape [B].");
+    }
+    if (keys.shape(2) == 0 || keys.shape(2) != values.shape(2)) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding requires nonempty "
+          "keys and values with matching sequence lengths.");
+    }
+    mask_arr = greater_equal(
+        arange(keys.shape(2), s),
+        reshape(*left_padding, {queries.shape(0), 1, 1, 1}, s),
+        s);
+  }
 
   // Check valid mask
   if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
@@ -985,6 +1015,17 @@ array scaled_dot_product_attention(
           full_like(mask, -inf, final_type, stream),
           stream);
     }
+    // This single-query GQA shape already uses two-pass vector attention on
+    // Metal. On other shapes and backends the ordinary mask is sufficient.
+    const bool use_logical_blocks = left_padding && !is_training &&
+        !detail::in_export_tracing() && stream.device == Device::gpu &&
+        metal::is_available() && q.dtype() == bfloat16 && q.shape(2) == 1 &&
+        q.shape(3) == 128 && v.shape(3) == 128 && k.shape(2) >= 4096 &&
+        n_q_heads / n_kv_heads == 4;
+    if (use_logical_blocks) {
+      // Keep the mask operand for graph transforms using the fallback.
+      inputs.push_back(contiguous(*left_padding, false, stream));
+    }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
         stream,
@@ -1007,6 +1048,57 @@ array scaled_dot_product_attention(
     }
   }
   return fallback(std::move(inputs))[0];
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    StreamOrDevice s) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      window_size,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      std::nullopt,
+      s);
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const array& left_padding,
+    StreamOrDevice s) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      window_size,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      left_padding,
+      s);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

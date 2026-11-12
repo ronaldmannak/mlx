@@ -12,6 +12,7 @@ constant bool float_mask [[function_constant(24)]];
 constant bool has_sinks [[function_constant(25)]];
 constant int blocks [[function_constant(26)]];
 constant int window_size [[function_constant(27)]];
+constant bool has_left_padding [[function_constant(28)]];
 constant bool has_window = window_size > 0;
 
 // Visible keys [lo, hi) of the query at position pos
@@ -233,6 +234,8 @@ template <typename T, int D, int V = D, int TK = 4>
     const constant int& mask_head_stride
     [[buffer(17), function_constant(has_mask)]],
     const device T* sinks [[buffer(18), function_constant(has_sinks)]],
+    const device int* left_padding
+    [[buffer(19), function_constant(has_left_padding)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -264,19 +267,30 @@ template <typename T, int D, int V = D, int TK = 4>
 
   queries += q_offset * D + simd_lid * qk_per_thread;
 
+  // Read at logical key indices so left-padding cannot rotate the partials
+  // presented to the second pass. Write the partials at the same block_idx.
+  int first_key = block_idx;
+  int read_start = block_idx;
+  if (has_left_padding) {
+    const int pad = clamp(left_padding[batch_idx], 0, N);
+    first_key = pad + min(block_idx, N - pad);
+    // Empty blocks still write zero partials but must not read any K/V.
+    read_start = min(first_key, N - 1);
+  }
+
   const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
-  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
+  keys += kv_batch_head_idx * k_head_stride + read_start * k_seq_stride +
       simd_lid * qk_per_thread;
-  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+  values += kv_batch_head_idx * v_head_stride + read_start * v_seq_stride +
       simd_lid * v_per_thread;
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
-        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   if (float_mask) {
     fmask += q_batch_head_idx * mask_head_stride +
-        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
@@ -299,7 +313,7 @@ template <typename T, int D, int V = D, int TK = 4>
       (bool_mask || float_mask) ? blocks * mask_kv_seq_stride : 0;
 
   // For each key
-  int i = block_idx;
+  int i = first_key;
 
   // Prepare for windows
   int lo = 0;

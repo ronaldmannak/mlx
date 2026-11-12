@@ -64,6 +64,23 @@ MLX_API array scaled_dot_product_attention(
     bool force_fused = false,
     StreamOrDevice s = {});
 
+/** SDPA with an int32 [B] array of left-padding counts for keys and values.
+ * Cannot be combined with another mask, a window, or sinks. Not supported
+ * in shapeless tracing.
+ */
+MLX_API array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const array& left_padding,
+    StreamOrDevice s);
+
 /** Updates recurrent state with the gated delta rule. */
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,
