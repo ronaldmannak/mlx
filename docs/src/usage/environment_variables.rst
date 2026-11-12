@@ -123,12 +123,14 @@ Metal
 
 .. envvar:: MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW
 
-   Set to ``1`` to use the single-row Metal kernel for each activation row in
+   Set to ``1`` to match single-row Metal results in
    :func:`mlx.core.quantized_matmul` with affine quantization and
-   ``transpose=True``. The default is ``0``. This can reduce throughput for
-   wide batches and prompt prefill because the vector kernels read the weights
-   for each row. For decode-only use, scope the setting to the evaluation of
-   decode operations with :func:`mlx.core.config.scoped_update`.
+   ``transpose=True``. For eligible aligned 4-bit BF16 and FP16 projections,
+   the vector kernel shares packed weight loads across two activation rows
+   while keeping each row's reduction order. The default is ``0``. Exact
+   mode can reduce throughput for wide batches and prompt prefill. For
+   decode-only use, scope the setting to evaluation of the decode operations
+   with :func:`mlx.core.config.scoped_update`.
 
 .. envvar:: MLX_CONV_WINOGRAD
 

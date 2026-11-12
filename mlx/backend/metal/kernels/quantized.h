@@ -218,6 +218,20 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   return sum;
 }
 
+template <typename U, int values_per_thread, typename PackedWords>
+inline U
+qdot_4bit(PackedWords ws, const thread U* x_thread, U scale, U bias, U sum) {
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    accum +=
+        (x_thread[4 * i] * (ws[i] & 0x000f) +
+         x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+         x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+         x_thread[4 * i + 3] * (ws[i] & 0xf000));
+  }
+  return scale * accum + sum * bias;
+}
+
 template <typename U, int values_per_thread, int bits>
 inline U qdot(
     const device uint8_t* w,
@@ -277,14 +291,8 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
-    }
+    return qdot_4bit<U, values_per_thread>(
+        (const device uint16_t*)w, x_thread, scale, bias, sum);
   }
 
   else if (bits == 5) {
@@ -1796,6 +1804,81 @@ template <
       tid,
       simd_gid,
       simd_lid);
+}
+
+template <typename T, bool aligned_m>
+[[kernel]] void affine_qmv_fast_pair(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int tile_rows = 2;
+  constexpr int outputs_per_simdgroup = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int group_size = 64;
+
+  const int first_row = tid.x * tile_rows;
+  const int first_col = (tid.y * 2 + simd_gid) * outputs_per_simdgroup;
+  const int active_rows = aligned_m ? tile_rows : min(tile_rows, M - first_row);
+  const device ushort* packed = (const device ushort*)w;
+  float accum[tile_rows][outputs_per_simdgroup] = {};
+
+  // Reuse weights across rows with the same K blocks and reduction as qmv_fast.
+  for (int block = 0; block < K; block += block_size) {
+    const int start = block + simd_lid * values_per_thread;
+    ushort4 weight_words[outputs_per_simdgroup];
+    float weight_scales[outputs_per_simdgroup];
+    float weight_biases[outputs_per_simdgroup];
+
+#pragma unroll
+    for (int col = 0; col < outputs_per_simdgroup; col++) {
+      const int64_t offset = int64_t(first_col + col) * K + start;
+      const device ushort* words = packed + offset / 4;
+      weight_words[col] = ushort4(words[0], words[1], words[2], words[3]);
+      weight_scales[col] = scales[offset / group_size];
+      weight_biases[col] = biases[offset / group_size];
+    }
+
+#pragma unroll
+    for (int row = 0; row < tile_rows; row++) {
+      if (row < active_rows) {
+        float x_thread[values_per_thread];
+        const float sum = load_vector<T, float, values_per_thread, 4>(
+            x + int64_t(first_row + row) * K + start, x_thread);
+#pragma unroll
+        for (int col = 0; col < outputs_per_simdgroup; col++) {
+          accum[row][col] += qdot_4bit<float, values_per_thread>(
+              weight_words[col],
+              x_thread,
+              weight_scales[col],
+              weight_biases[col],
+              sum);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int row = 0; row < tile_rows; row++) {
+    if (row < active_rows) {
+#pragma unroll
+      for (int col = 0; col < outputs_per_simdgroup; col++) {
+        const float value = simd_sum(accum[row][col]);
+        if (simd_lid == 0) {
+          y[int64_t(first_row + row) * N + first_col + col] =
+              static_cast<T>(value);
+        }
+      }
+    }
+  }
 }
 
 template <

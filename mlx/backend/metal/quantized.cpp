@@ -540,6 +540,39 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void qmv_fast_pair(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  bool aligned_m = M % 2 == 0;
+  auto type = get_type_string(x.dtype());
+  std::string name =
+      "affine_qmv_fast_pair_" + type + (aligned_m ? "_alM_1" : "_alM_0");
+  auto template_def =
+      get_template_definition(name, "affine_qmv_fast_pair", type, aligned_m);
+  auto kernel = get_quantized_kernel(d, name, template_def, "affine");
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(w, 0);
+  compute_encoder.set_input_array(scales, 1);
+  compute_encoder.set_input_array(biases, 2);
+  compute_encoder.set_input_array(x, 3);
+  compute_encoder.set_output_array(out, 4);
+  compute_encoder.set_bytes(K, 5);
+  compute_encoder.set_bytes(N, 6);
+  compute_encoder.set_bytes(M, 7);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(ceildiv(M, 2), N / 8, 1), MTL::Size(32, 2, 1));
+}
+
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
 inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
   return (mode != "affine" || d.get_architecture_gen() >= 15) &&
@@ -2298,6 +2331,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (transpose_) {
     if (M > 1 && mode_ == QuantizationMode::Affine &&
         config::get("MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW", 0)) {
+      if (non_batched && M >= 4 && N >= 4096 && N % 8 == 0 && bits_ == 4 &&
+          group_size_ == 64 && K % qmv_fast_k_alignment(bits_) == 0 &&
+          (x.dtype() == bfloat16 || x.dtype() == float16)) {
+        qmv_fast_pair(x, w, scales, *biases, out, M, N, K, d, s);
+        return;
+      }
       dispatch_qmv(
           x,
           w,

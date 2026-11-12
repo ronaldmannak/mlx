@@ -1441,12 +1441,22 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (mx.float32, 64, 128, (2, 34)),
             (mx.bfloat16, 1024, 2112, (2, 5, 6, 8, 16, 17, 24, 25)),
             (mx.float32, 1024, 2112, (7, 8, 12, 25)),
-            (mx.bfloat16, 512, 8256, (12, 13)),
+            # Aligned affine projections exercise two-row tiles and odd tails.
+            (mx.bfloat16, 4096, 4096, (3, 4, 5, 8, 12)),
+            (mx.float16, 512, 8256, (3, 4, 5, 12, 13)),
         ]
         for dtype, k, n, widths in cases:
             w = mx.random.normal((n, k), key=key_w).astype(dtype)
             x = mx.random.normal((max(widths), k), key=key_x).astype(dtype)
             weights = mx.quantize(w, group_size=64, bits=4)
+            if dtype == mx.float16:
+                # Keep the matrices contiguous but shift each buffer by one element.
+                weights = tuple(
+                    mx.concatenate([mx.zeros((1,), t.dtype), t.flatten()])[1:].reshape(
+                        t.shape
+                    )
+                    for t in weights
+                )
             singletons = mx.concatenate([project(row[None, :], weights) for row in x])
             with mx.config.scoped_update(MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW=0):
                 mx.eval(singletons)
@@ -1458,6 +1468,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     with self.subTest(dtype=dtype, k=k, n=n, width=width):
                         actual = project(x[:width], weights)
                         expected = singletons[:width]
+                        if dtype in (mx.bfloat16, mx.float16):
+                            actual = actual.view(mx.uint16)
+                            expected = expected.view(mx.uint16)
                         self.assertTrue(mx.array_equal(actual, expected).item())
 
         # Broadcast weights over one batch axis and use a strided input matrix.
