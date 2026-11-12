@@ -637,6 +637,62 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_vector_left_padding_preserves_logical_block_order(self):
+        # Zero queries and keys give uniform attention. The three nonzero
+        # values make BF16 output sensitive to rotation of the block partials.
+        with mx.stream(mx.gpu), mx.config.scoped_update(MLX_SDPA_BLOCKS=64):
+            n = 4245
+            pad = 101
+            q = mx.zeros((2, 32, 1, 128), dtype=mx.bfloat16)
+            k = mx.zeros((2, 8, n, 128), dtype=mx.bfloat16)
+            positions = mx.arange(n)
+            values = mx.where(positions == pad + 13, 2**27, 0)
+            values -= mx.where(positions == pad + 5, 2**27, 0)
+            values += positions == pad + 23
+            v = mx.broadcast_to(
+                values[None, None, :, None].astype(mx.bfloat16), k.shape
+            )
+            # Also cover a strided array of padding counts.
+            pads = mx.array([0, -1, pad, -1])[::2]
+            scale = 128**-0.5
+            padded = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, left_padding=pads
+            )
+            solo = mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(
+                        q[row : row + 1],
+                        k[row : row + 1, :, row_pad:],
+                        v[row : row + 1, :, row_pad:],
+                        scale=scale,
+                    )
+                    for row, row_pad in enumerate([0, pad])
+                ]
+            )
+            self.assertTrue(mx.array_equal(padded, solo).item())
+
+    def test_sdpa_left_padding_mask_fallback(self):
+        with mx.stream(mx.cpu):
+            q = mx.ones((2, 2, 2, 4))
+            k = mx.ones((2, 1, 5, 4))
+            v = mx.arange(40, dtype=mx.float32).reshape(k.shape)
+            pads = mx.array([1, 2])
+            mask = mx.arange(5) >= pads[:, None, None, None]
+            padded = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=0.5, left_padding=pads
+            )
+            masked = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.5, mask=mask)
+            self.assertTrue(mx.array_equal(padded, masked).item())
+            with self.assertRaisesRegex(ValueError, "array of shape"):
+                mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=0.5, left_padding=mx.array([1])
+                )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=0.5, mask="causal", left_padding=pads
+                )
+
     @unittest.skipIf(not mx.is_available(mx.gpu), "too slow on CPU")
     @unittest.skipIf(mx.cuda.is_available() and "CI" in os.environ, "not enough memory")
     def test_sdpa_vector_gqa_long(self):
