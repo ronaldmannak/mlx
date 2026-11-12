@@ -2164,7 +2164,8 @@ void dispatch_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool allow_wide = true) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale) {
@@ -2174,7 +2175,7 @@ void dispatch_qmv(
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
-  if (M >= 2 && !global_scale && use_qmv_wide(mode, d)) {
+  if (allow_wide && M >= 2 && !global_scale && use_qmv_wide(mode, d)) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -2295,6 +2296,26 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
 
   if (transpose_) {
+    if (M > 1 && mode_ == QuantizationMode::Affine &&
+        config::get("MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW", 0)) {
+      dispatch_qmv(
+          x,
+          w,
+          scales,
+          biases,
+          std::nullopt,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          quantization_mode_to_string(mode_),
+          /*allow_wide=*/false);
+      return;
+    }
     dispatch_qmm_t(
         x,
         w,

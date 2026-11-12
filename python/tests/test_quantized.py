@@ -1427,6 +1427,52 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     singletons = mx.concatenate([project(row[None, :]) for row in x])
                     self.assertTrue(mx.array_equal(batched, singletons).item())
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_metal_quantized_matmul_match_single_row(self):
+        key_w, key_x = mx.random.split(mx.random.key(0))
+
+        def project(rows, weights):
+            return mx.quantized_matmul(
+                rows, *weights, group_size=64, bits=4, stream=mx.gpu
+            )
+
+        cases = [
+            # Quad, NAX matvec, NAX split-K and the general QMM cutoffs.
+            (mx.float32, 64, 128, (2, 34)),
+            (mx.bfloat16, 1024, 2112, (2, 5, 6, 8, 16, 17, 24, 25)),
+            (mx.float32, 1024, 2112, (7, 8, 12, 25)),
+            (mx.bfloat16, 512, 8256, (12, 13)),
+        ]
+        for dtype, k, n, widths in cases:
+            w = mx.random.normal((n, k), key=key_w).astype(dtype)
+            x = mx.random.normal((max(widths), k), key=key_x).astype(dtype)
+            weights = mx.quantize(w, group_size=64, bits=4)
+            singletons = mx.concatenate([project(row[None, :], weights) for row in x])
+            with mx.config.scoped_update(MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW=0):
+                mx.eval(singletons)
+            # Enable TF32 so eligible FP32 shapes can enter NAX split-K.
+            with mx.config.scoped_update(
+                MLX_ENABLE_TF32=1, MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW=1
+            ):
+                for width in widths:
+                    with self.subTest(dtype=dtype, k=k, n=n, width=width):
+                        actual = project(x[:width], weights)
+                        expected = singletons[:width]
+                        self.assertTrue(mx.array_equal(actual, expected).item())
+
+        # Broadcast weights over one batch axis and use a strided input matrix.
+        x = mx.random.normal((2, 3, 512, 34), key=key_x).swapaxes(-2, -1)
+        w = mx.random.normal((3, 128, 512), key=key_w)
+        weights = mx.quantize(w, group_size=64, bits=4)
+        singletons = mx.concatenate(
+            [project(x[..., i : i + 1, :], weights) for i in range(x.shape[-2])],
+            axis=-2,
+        )
+        with mx.config.scoped_update(MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW=0):
+            mx.eval(singletons)
+        with mx.config.scoped_update(MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW=1):
+            self.assertTrue(mx.array_equal(project(x, weights), singletons).item())
+
     def test_qvm(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
