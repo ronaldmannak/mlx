@@ -1015,13 +1015,12 @@ static array scaled_dot_product_attention_impl(
           full_like(mask, -inf, final_type, stream),
           stream);
     }
-    // This single-query GQA shape already uses two-pass vector attention on
-    // Metal. On other shapes and backends the ordinary mask is sufficient.
+    // This single-query Metal GQA shape keeps the same two-pass block count
+    // at all lengths. Other shapes and backends use the ordinary mask.
     const bool use_logical_blocks = left_padding && !is_training &&
         !detail::in_export_tracing() && stream.device == Device::gpu &&
         metal::is_available() && q.dtype() == bfloat16 && q.shape(2) == 1 &&
-        q.shape(3) == 128 && v.shape(3) == 128 && k.shape(2) >= 4096 &&
-        n_q_heads / n_kv_heads == 4;
+        q.shape(3) == 128 && v.shape(3) == 128 && n_q_heads / n_kv_heads == 4;
     if (use_logical_blocks) {
       // Keep the mask operand for graph transforms using the fallback.
       inputs.push_back(contiguous(*left_padding, false, stream));

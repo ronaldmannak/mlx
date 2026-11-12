@@ -121,6 +121,17 @@ Metal
    as a single row for those shapes and may reduce throughput. The default is
    ``0``.
 
+.. envvar:: MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW
+
+   Set to ``1`` to match single-row Metal results in
+   :func:`mlx.core.quantized_matmul` with affine quantization and
+   ``transpose=True``. For eligible aligned 4-bit BF16 and FP16 projections,
+   the vector kernel shares packed weight loads across two activation rows
+   while keeping each row's reduction order. The default is ``0``. Exact
+   mode can reduce throughput for wide batches and prompt prefill. For
+   decode-only use, scope the setting to evaluation of the decode operations
+   with :func:`mlx.core.config.scoped_update`.
+
 .. envvar:: MLX_CONV_WINOGRAD
 
    Allow the Winograd algorithm for 3x3 ``conv2d``. The default is ``1``. Set

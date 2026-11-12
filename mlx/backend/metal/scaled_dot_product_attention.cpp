@@ -709,7 +709,9 @@ bool sdpa_vector(
     bool do_causal,
     int window_size,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    const std::optional<array>& left_padding = std::nullopt,
+    int two_pass_min_keys = 0) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -736,6 +738,7 @@ bool sdpa_vector(
   bool float_mask = has_mask && !bool_mask;
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
+  bool has_left_padding = left_padding.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -744,6 +747,7 @@ bool sdpa_vector(
       {&float_mask, MTL::DataType::DataTypeBool, 24},
       {&has_sinks, MTL::DataType::DataTypeBool, 25},
       {&window_size, MTL::DataType::DataTypeInt, 27},
+      {&has_left_padding, MTL::DataType::DataTypeBool, 28},
   };
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -751,6 +755,10 @@ bool sdpa_vector(
   hash_name += do_causal ? "_c" : "_nc";
   hash_name += has_sinks ? "_sinks" : "_nosinks";
   hash_name += window_size > 0 ? "_w" + std::to_string(window_size) : "_nw";
+
+  if (left_padding) {
+    hash_name += "_leftpad";
+  }
 
   // Get the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -787,7 +795,13 @@ bool sdpa_vector(
   }
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 16);
+  }
+  if (has_sinks || left_padding) {
     compute_encoder.set_bytes(q.shape(1), 17);
+  }
+  if (left_padding) {
+    compute_encoder.set_input_array(*left_padding, 18);
+    compute_encoder.set_bytes(two_pass_min_keys, 19);
   }
 
   // Launch
@@ -807,7 +821,8 @@ void sdpa_vector_2pass(
     int window_size,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
-    const std::optional<array>& left_padding = std::nullopt) {
+    const std::optional<array>& left_padding = std::nullopt,
+    int two_pass_min_keys = 0) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -980,6 +995,7 @@ void sdpa_vector_2pass(
 
   if (left_padding) {
     compute_encoder.set_input_array(*left_padding, 19);
+    compute_encoder.set_bytes(two_pass_min_keys, 20);
   }
 
   // Launch
@@ -993,7 +1009,11 @@ void sdpa_vector_2pass(
   kname += std::to_string(v.shape(-1));
 
   // Get the kernel
-  kernel = d.get_kernel(kname);
+  bool filter_short_rows = has_left_padding && two_pass_min_keys > 0;
+  metal::MTLFCList reduce_consts = {
+      {&filter_short_rows, MTL::DataType::DataTypeBool, 28}};
+  kernel = d.get_kernel(
+      kname, filter_short_rows ? kname + "_rowfilter" : kname, reduce_consts);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
@@ -1002,6 +1022,12 @@ void sdpa_vector_2pass(
   compute_encoder.set_input_array(maxs, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(blocks, 4);
+  if (filter_short_rows) {
+    compute_encoder.set_input_array(*left_padding, 5);
+    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(q.shape(1), 7);
+    compute_encoder.set_bytes(two_pass_min_keys, 8);
+  }
 
   // Launch
   group_dims = MTL::Size(1024, 1, 1);
@@ -1902,18 +1928,49 @@ void ScaledDotProductAttention::eval_gpu(
         ? std::optional<array>{copy_unless(mask_copy_unless, inputs[3])}
         : std::nullopt;
 
-    // We route to the 2 pass fused attention if
-    // - The device is large and the sequence length long
-    // - The sequence length is even longer and we have gqa
     bool csl = do_causal_ && q.shape(2) > 1;
     int ws = window_size_;
     int n_keys = visible_keys(k.shape(2), q.shape(2), ws, csl);
     char devc = d.get_architecture().back();
-    if (left_padding || ((devc == 'd' || devc == 's') && n_keys >= 1024) ||
-        (k.shape(1) < q.shape(1) && n_keys >= 4096)) {
-      sdpa_vector_2pass(
-          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding);
-    } else if (!sdpa_vector(s, d, q, k, v, o, scale_, csl, ws, mask, sinks)) {
+    int two_pass_min_keys = (devc == 'd' || devc == 's')
+        ? 1024
+        : (k.shape(1) < q.shape(1) ? 4096 : std::numeric_limits<int>::max());
+    if (left_padding) {
+      // Each kernel writes only the rows it would handle without padding.
+      // For this GQA shape the two-pass block count is independent of length.
+      bool single_pass_available = sdpa_vector(
+          s,
+          d,
+          q,
+          k,
+          v,
+          o,
+          scale_,
+          csl,
+          ws,
+          mask,
+          sinks,
+          left_padding,
+          two_pass_min_keys);
+      if (!single_pass_available || n_keys >= two_pass_min_keys) {
+        sdpa_vector_2pass(
+            s,
+            d,
+            q,
+            k,
+            v,
+            o,
+            scale_,
+            csl,
+            ws,
+            mask,
+            sinks,
+            left_padding,
+            single_pass_available ? two_pass_min_keys : 0);
+      }
+    } else if (
+        n_keys >= two_pass_min_keys ||
+        !sdpa_vector(s, d, q, k, v, o, scale_, csl, ws, mask, sinks)) {
       sdpa_vector_2pass(s, d, q, k, v, o, scale_, csl, ws, mask, sinks);
     }
   }

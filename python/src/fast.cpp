@@ -368,8 +368,9 @@ void init_fast(nb::module_& parent_module) {
                row. Each row must have at least one unpadded key. Cannot be
                combined with ``mask``, ``window_size``, or ``sinks`` and
                is unavailable in shapeless tracing.
-               Supported Metal decode shapes skip these positions before
-               loading keys and values. Other shapes use a boolean mask.
+               Single-query BF16 Metal attention with head dimension 128 and
+               GQA ratio 4 skips these positions and chooses a kernel per row
+               using the unpadded key length. Other shapes use a boolean mask.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
             force_fused (bool, optional): If ``True``, use a fused kernel
