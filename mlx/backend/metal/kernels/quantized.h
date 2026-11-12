@@ -1840,7 +1840,7 @@ template <typename T, bool aligned_m>
 
 #pragma unroll
     for (int col = 0; col < outputs_per_simdgroup; col++) {
-      const int64_t offset = int64_t(first_col + col) * K + start;
+      const int offset = (first_col + col) * K + start;
       const device ushort* words = packed + offset / 4;
       weight_words[col] = ushort4(words[0], words[1], words[2], words[3]);
       weight_scales[col] = scales[offset / group_size];
@@ -1852,7 +1852,7 @@ template <typename T, bool aligned_m>
       if (row < active_rows) {
         float x_thread[values_per_thread];
         const float sum = load_vector<T, float, values_per_thread, 4>(
-            x + int64_t(first_row + row) * K + start, x_thread);
+            x + (first_row + row) * K + start, x_thread);
 #pragma unroll
         for (int col = 0; col < outputs_per_simdgroup; col++) {
           accum[row][col] += qdot_4bit<float, values_per_thread>(
@@ -1873,8 +1873,7 @@ template <typename T, bool aligned_m>
       for (int col = 0; col < outputs_per_simdgroup; col++) {
         const float value = simd_sum(accum[row][col]);
         if (simd_lid == 0) {
-          y[int64_t(first_row + row) * N + first_col + col] =
-              static_cast<T>(value);
+          y[(first_row + row) * N + first_col + col] = static_cast<T>(value);
         }
       }
     }

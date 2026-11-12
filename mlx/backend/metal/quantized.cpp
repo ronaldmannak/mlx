@@ -1,5 +1,7 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <limits>
+
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -2331,9 +2333,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (transpose_) {
     if (M > 1 && mode_ == QuantizationMode::Affine &&
         config::get("MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW", 0)) {
+      // The paired kernel uses 32-bit element offsets.
+      constexpr int64_t max_offset = std::numeric_limits<int>::max();
       if (non_batched && M >= 4 && N >= 4096 && N % 8 == 0 && bits_ == 4 &&
           group_size_ == 64 && K % qmv_fast_k_alignment(bits_) == 0 &&
-          (x.dtype() == bfloat16 || x.dtype() == float16)) {
+          (x.dtype() == bfloat16 || x.dtype() == float16) &&
+          int64_t(K) * N <= max_offset &&
+          int64_t(M) * std::max(K, N) <= max_offset) {
         qmv_fast_pair(x, w, scales, *biases, out, M, N, K, d, s);
         return;
       }
