@@ -268,21 +268,22 @@ void init_fast(nb::module_& parent_module) {
          bool force_fused,
          const std::optional<mx::array>& left_padding,
          mx::StreamOrDevice s) {
-        std::string mask_mode;
-        std::optional<mx::array> mask_arr;
-        if (const auto* mode = std::get_if<std::string>(&mask)) {
-          if (*mode != "causal") {
-            std::ostringstream msg;
-            msg << "[scaled_dot_product_attention] invalid mask option '"
-                << *mode << "'. Must be 'causal', or an array.";
-            throw std::invalid_argument(msg.str());
+        auto attend = [&](const std::string& mask_mode,
+                          const std::optional<mx::array>& mask_arr) {
+          if (left_padding) {
+            return mx::fast::scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale,
+                window_size,
+                mask_mode,
+                mask_arr,
+                sinks,
+                force_fused,
+                *left_padding,
+                s);
           }
-          mask_mode = *mode;
-        } else if (const auto* arr = std::get_if<mx::array>(&mask)) {
-          mask_arr = *arr;
-        }
-
-        if (left_padding) {
           return mx::fast::scaled_dot_product_attention(
               queries,
               keys,
@@ -293,20 +294,32 @@ void init_fast(nb::module_& parent_module) {
               mask_arr,
               sinks,
               force_fused,
-              *left_padding,
               s);
+        };
+
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
+
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              std::ostringstream msg;
+              msg << "[scaled_dot_product_attention] invalid mask option '"
+                  << mask_str << "'. Must be 'causal', or an array.";
+              throw std::invalid_argument(msg.str());
+            }
+            return attend(mask_str, std::nullopt);
+          } else {
+            auto mask_arr = std::get<mx::array>(mask);
+            return attend("", mask_arr);
+          }
+
+        } else {
+          return attend("", {});
         }
-        return mx::fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale,
-            window_size,
-            mask_mode,
-            mask_arr,
-            sinks,
-            force_fused,
-            s);
       },
       "q"_a,
       "k"_a,

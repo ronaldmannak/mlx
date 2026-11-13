@@ -1054,12 +1054,12 @@ array scaled_dot_product_attention(
     const array& keys,
     const array& values,
     const float scale,
-    int window_size,
-    const std::string& mask_mode,
-    std::optional<array> mask_arr,
-    const std::optional<array>& sinks,
-    bool force_fused,
-    StreamOrDevice s) {
+    int window_size /* = -1 */,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    bool force_fused /* = false */,
+    StreamOrDevice s /* = {} */) {
   return scaled_dot_product_attention_impl(
       queries,
       keys,

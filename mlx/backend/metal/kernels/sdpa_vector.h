@@ -75,6 +75,7 @@ template <typename T, int D, int V = D>
   const int q_batch_head_idx = tid.x;
   const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
+  const int kv_seq_idx = simd_gid;
   // Skip the left-padded keys of this row: simdgroup g starts at the row's
   // g-th valid key instead of the g-th stored key.
   int first_key = simd_gid;
@@ -95,23 +96,23 @@ template <typename T, int D, int V = D>
       simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
-        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        kv_seq_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   if (float_mask) {
     fmask += q_batch_head_idx * mask_head_stride +
-        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        kv_seq_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
 
   out += o_offset * V + simd_gid * v_per_thread;
 
   // Restrict the keys to the window
+  int lo = 0;
   int hi = N;
   if (has_window) {
     // Offset = kL - qL = N - tpg.y
     auto range = window_range(N - int(tpg.y) + int(q_seq_idx), N);
-    const int lo = range.x;
+    lo = range.x;
     hi = range.y;
-    first_key += lo;
 
     // Move all arrays ahead by lo
     keys += lo * k_seq_stride;
@@ -140,7 +141,7 @@ template <typename T, int D, int V = D>
   }
 
   // For each key in valid range
-  for (int i = first_key; i < hi; i += BN) {
+  for (int i = lo + first_key; i < hi; i += BN) {
     bool use_key = true;
     if (do_causal) {
       use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
@@ -298,11 +299,11 @@ template <typename T, int D, int V = D, int TK = 4>
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
-        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   if (float_mask) {
     fmask += q_batch_head_idx * mask_head_stride +
-        read_start * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
