@@ -637,6 +637,113 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_vector_left_padding_preserves_logical_block_order(self):
+        # Zero queries and keys give uniform attention. The three nonzero
+        # values make BF16 output sensitive to rotation of the block partials.
+        with mx.stream(mx.gpu), mx.config.scoped_update(MLX_SDPA_BLOCKS=64):
+            n = 4245
+            pad = 101
+            q = mx.zeros((2, 32, 1, 128), dtype=mx.bfloat16)
+            k = mx.zeros((2, 8, n, 128), dtype=mx.bfloat16)
+            positions = mx.arange(n)
+            values = mx.where(positions == pad + 13, 2**27, 0)
+            values -= mx.where(positions == pad + 5, 2**27, 0)
+            values += positions == pad + 23
+            v = mx.broadcast_to(
+                values[None, None, :, None].astype(mx.bfloat16), k.shape
+            )
+            # Also cover a strided array of padding counts.
+            pads = mx.array([0, -1, pad, -1])[::2]
+            scale = 128**-0.5
+            padded = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, left_padding=pads
+            )
+            solo = mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(
+                        q[row : row + 1],
+                        k[row : row + 1, :, row_pad:],
+                        v[row : row + 1, :, row_pad:],
+                        scale=scale,
+                    )
+                    for row, row_pad in enumerate([0, pad])
+                ]
+            )
+            self.assertTrue(mx.array_equal(padded, solo).item())
+
+    def test_sdpa_left_padding_mask_fallback(self):
+        with mx.stream(mx.cpu):
+            q = mx.ones((2, 2, 2, 4))
+            k = mx.ones((2, 1, 5, 4))
+            v = mx.arange(40, dtype=mx.float32).reshape(k.shape)
+            pads = mx.array([1, 2])
+            mask = mx.arange(5) >= pads[:, None, None, None]
+            padded = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=0.5, left_padding=pads
+            )
+            masked = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.5, mask=mask)
+            self.assertTrue(mx.array_equal(padded, masked).item())
+            with self.assertRaisesRegex(ValueError, "array of shape"):
+                mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=0.5, left_padding=mx.array([1])
+                )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=0.5, mask="causal", left_padding=pads
+                )
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_vector_left_padding_shapes(self):
+        # (query dim, value dim, query heads, key/value heads)
+        shapes = [
+            (64, 64, 4, 4),
+            (64, 64, 16, 2),
+            (96, 64, 8, 2),
+            (96, 96, 6, 6),
+            (128, 128, 8, 2),
+            (128, 128, 24, 2),
+            (128, 128, 32, 2),
+            (192, 128, 8, 4),
+            (192, 192, 4, 2),
+            (256, 256, 8, 1),
+            (512, 512, 8, 1),
+        ]
+        tolerances = {mx.float32: 1e-4, mx.float16: 2e-3, mx.bfloat16: 2e-2}
+        mx.random.seed(0)
+        # 40 keys leave simdgroups and blocks without any; 1500 and 5000 reach
+        # the two-pass kernel on large and on all devices.
+        for (D, V, H, KH), N, L in product(shapes, (40, 1500, 5000), (1, 3, 16)):
+            if L <= 8 and L * (H // KH) > 32:
+                continue
+            # A full row, a row with one key, and one in between.
+            pads = mx.array([0, N - 1, N // 3])
+            mask = mx.arange(N) >= pads[:, None, None, None]
+            # A large scale gives peaked attention, so a missed or extra key
+            # moves the output.
+            scale = 4 * D**-0.5
+            q32 = mx.random.normal((3, H, L, D))
+            k32 = mx.random.normal((3, KH, N, D))
+            v32 = mx.random.normal((3, KH, N, V))
+            for dtype, tol in tolerances.items():
+                q, k, v = (x.astype(dtype) for x in (q32, k32, v32))
+                padded = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, left_padding=pads, stream=mx.gpu
+                )
+                masked = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=mask, stream=mx.gpu
+                )
+                self.assertTrue(
+                    mx.allclose(padded, masked, atol=tol, rtol=tol).item(),
+                    f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}",
+                )
+                # The row with one key attends only to it.
+                last = mx.repeat(v[1, :, -1], H // KH, axis=0)[:, None]
+                self.assertTrue(
+                    mx.allclose(padded[1], last, atol=tol, rtol=tol).item(),
+                    f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}",
+                )
+
     @unittest.skipIf(not mx.is_available(mx.gpu), "too slow on CPU")
     @unittest.skipIf(mx.cuda.is_available() and "CI" in os.environ, "not enough memory")
     def test_sdpa_vector_gqa_long(self):

@@ -709,7 +709,8 @@ bool sdpa_vector(
     bool do_causal,
     int window_size,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    const std::optional<array>& left_padding = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -736,6 +737,7 @@ bool sdpa_vector(
   bool float_mask = has_mask && !bool_mask;
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
+  bool has_left_padding = left_padding.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -744,6 +746,7 @@ bool sdpa_vector(
       {&float_mask, MTL::DataType::DataTypeBool, 24},
       {&has_sinks, MTL::DataType::DataTypeBool, 25},
       {&window_size, MTL::DataType::DataTypeInt, 27},
+      {&has_left_padding, MTL::DataType::DataTypeBool, 28},
   };
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -751,6 +754,9 @@ bool sdpa_vector(
   hash_name += do_causal ? "_c" : "_nc";
   hash_name += has_sinks ? "_sinks" : "_nosinks";
   hash_name += window_size > 0 ? "_w" + std::to_string(window_size) : "_nw";
+  if (has_left_padding) {
+    hash_name += "_leftpad";
+  }
 
   // Get the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -787,7 +793,12 @@ bool sdpa_vector(
   }
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 16);
+  }
+  if (has_sinks || has_left_padding) {
     compute_encoder.set_bytes(q.shape(1), 17);
+  }
+  if (has_left_padding) {
+    compute_encoder.set_input_array(*left_padding, 18);
   }
 
   // Launch
@@ -806,7 +817,8 @@ void sdpa_vector_2pass(
     bool do_causal,
     int window_size,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    const std::optional<array>& left_padding = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -815,9 +827,10 @@ void sdpa_vector_2pass(
   bool gqa_dims =
       (gqa_factor == 8 && (q.shape(-1) == 64 || q.shape(-1) == 128)) ||
       ((gqa_factor == 12 || gqa_factor == 16) && q.shape(-1) == 128);
-  if (!mask && !sinks && window_size <= 0 && q.shape(2) == 1 &&
-      q.shape(1) == gqa_factor * k.shape(1) && q.shape(-1) == v.shape(-1) &&
-      gqa_dims && k.shape(2) >= 8192) {
+  bool specialized_gqa = !mask && !sinks && !left_padding && window_size <= 0 &&
+      q.shape(2) == 1 && q.shape(1) == gqa_factor * k.shape(1) &&
+      q.shape(-1) == v.shape(-1) && gqa_dims && k.shape(2) >= 8192;
+  if (specialized_gqa) {
     kname += "_gqa_";
     kname += std::to_string(gqa_factor);
   }
@@ -903,6 +916,7 @@ void sdpa_vector_2pass(
   bool float_mask = has_mask && !bool_mask;
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
+  bool has_left_padding = left_padding.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -913,6 +927,10 @@ void sdpa_vector_2pass(
       {&blocks, MTL::DataType::DataTypeInt, 26},
       {&window_size, MTL::DataType::DataTypeInt, 27},
   };
+  if (!specialized_gqa) {
+    func_consts.emplace_back(
+        &has_left_padding, MTL::DataType::DataTypeBool, 28);
+  }
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
   hash_name += query_transposed ? "_qt" : "_qnt";
@@ -920,6 +938,10 @@ void sdpa_vector_2pass(
   hash_name += has_sinks ? "_sinks_" : "_nosinks_";
   hash_name += std::to_string(blocks);
   hash_name += window_size > 0 ? "_w" + std::to_string(window_size) : "_nw";
+
+  if (has_left_padding) {
+    hash_name += "_leftpad";
+  }
 
   // Get the kernel
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
@@ -965,6 +987,10 @@ void sdpa_vector_2pass(
   }
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 18);
+  }
+
+  if (left_padding) {
+    compute_encoder.set_input_array(*left_padding, 19);
   }
 
   // Launch
@@ -1779,6 +1805,12 @@ void ScaledDotProductAttention::eval_gpu(
     sinks = copy_unless(is_matrix_contiguous, inputs.back());
   }
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
+  // An extra operand after the mask carries the left-padding count of each
+  // row. Only the vector kernels read it; the mask at inputs[3] hides the same
+  // keys for every other path.
+  auto left_padding = !has_sinks_ && inputs.size() == 5
+      ? std::optional<array>{inputs[4]}
+      : std::nullopt;
 
   auto set_transposed_output = [&o]() {
     int64_t str_oD = 1;
@@ -1877,7 +1909,8 @@ void ScaledDotProductAttention::eval_gpu(
           (strides[0] == strides[1] * shape[1]);
     };
 
-    auto mask = has_arr_mask
+    // The padding offset already excludes every masked key in this mode.
+    auto mask = has_arr_mask && !left_padding
         ? std::optional<array>{copy_unless(mask_copy_unless, inputs[3])}
         : std::nullopt;
 
@@ -1890,9 +1923,23 @@ void ScaledDotProductAttention::eval_gpu(
     char devc = d.get_architecture().back();
     if (((devc == 'd' || devc == 's') && n_keys >= 1024) ||
         (k.shape(1) < q.shape(1) && n_keys >= 4096)) {
-      sdpa_vector_2pass(s, d, q, k, v, o, scale_, csl, ws, mask, sinks);
-    } else if (!sdpa_vector(s, d, q, k, v, o, scale_, csl, ws, mask, sinks)) {
-      sdpa_vector_2pass(s, d, q, k, v, o, scale_, csl, ws, mask, sinks);
+      sdpa_vector_2pass(
+          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding);
+    } else if (!sdpa_vector(
+                   s,
+                   d,
+                   q,
+                   k,
+                   v,
+                   o,
+                   scale_,
+                   csl,
+                   ws,
+                   mask,
+                   sinks,
+                   left_padding)) {
+      sdpa_vector_2pass(
+          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding);
     }
   }
 
