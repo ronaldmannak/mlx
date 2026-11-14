@@ -710,7 +710,8 @@ bool sdpa_vector(
     int window_size,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
-    const std::optional<array>& left_padding = std::nullopt) {
+    const std::optional<array>& left_padding = std::nullopt,
+    const std::optional<array>& kv_offsets = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -738,6 +739,7 @@ bool sdpa_vector(
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
   bool has_left_padding = left_padding.has_value();
+  bool has_kv_offsets = kv_offsets.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -747,6 +749,7 @@ bool sdpa_vector(
       {&has_sinks, MTL::DataType::DataTypeBool, 25},
       {&window_size, MTL::DataType::DataTypeInt, 27},
       {&has_left_padding, MTL::DataType::DataTypeBool, 28},
+      {&has_kv_offsets, MTL::DataType::DataTypeBool, 29},
   };
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -756,6 +759,9 @@ bool sdpa_vector(
   hash_name += window_size > 0 ? "_w" + std::to_string(window_size) : "_nw";
   if (has_left_padding) {
     hash_name += "_leftpad";
+  }
+  if (has_kv_offsets) {
+    hash_name += "_row_offsets";
   }
 
   // Get the kernel
@@ -800,6 +806,9 @@ bool sdpa_vector(
   if (has_left_padding) {
     compute_encoder.set_input_array(*left_padding, 18);
   }
+  if (has_kv_offsets) {
+    compute_encoder.set_input_array(*kv_offsets, 19);
+  }
 
   // Launch
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
@@ -818,7 +827,8 @@ void sdpa_vector_2pass(
     int window_size,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
-    const std::optional<array>& left_padding = std::nullopt) {
+    const std::optional<array>& left_padding = std::nullopt,
+    const std::optional<array>& kv_offsets = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -917,6 +927,7 @@ void sdpa_vector_2pass(
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
   bool has_left_padding = left_padding.has_value();
+  bool has_kv_offsets = kv_offsets.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -930,6 +941,7 @@ void sdpa_vector_2pass(
   if (!specialized_gqa) {
     func_consts.emplace_back(
         &has_left_padding, MTL::DataType::DataTypeBool, 28);
+    func_consts.emplace_back(&has_kv_offsets, MTL::DataType::DataTypeBool, 29);
   }
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -941,6 +953,9 @@ void sdpa_vector_2pass(
 
   if (has_left_padding) {
     hash_name += "_leftpad";
+  }
+  if (has_kv_offsets) {
+    hash_name += "_row_offsets";
   }
 
   // Get the kernel
@@ -991,6 +1006,9 @@ void sdpa_vector_2pass(
 
   if (left_padding) {
     compute_encoder.set_input_array(*left_padding, 19);
+  }
+  if (has_kv_offsets) {
+    compute_encoder.set_input_array(*kv_offsets, 20);
   }
 
   // Launch
@@ -1810,6 +1828,8 @@ void ScaledDotProductAttention::eval_gpu(
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
   auto left_padding =
       has_left_padding_ ? std::optional<array>{inputs[3]} : std::nullopt;
+  auto kv_offsets =
+      has_kv_offsets_ ? std::optional<array>{inputs[4]} : std::nullopt;
 
   auto set_transposed_output = [&o]() {
     int64_t str_oD = 1;
@@ -1923,7 +1943,19 @@ void ScaledDotProductAttention::eval_gpu(
     if (((devc == 'd' || devc == 's') && n_keys >= 1024) ||
         (k.shape(1) < q.shape(1) && n_keys >= 4096)) {
       sdpa_vector_2pass(
-          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding);
+          s,
+          d,
+          q,
+          k,
+          v,
+          o,
+          scale_,
+          csl,
+          ws,
+          mask,
+          sinks,
+          left_padding,
+          kv_offsets);
     } else if (!sdpa_vector(
                    s,
                    d,
@@ -1936,9 +1968,22 @@ void ScaledDotProductAttention::eval_gpu(
                    ws,
                    mask,
                    sinks,
-                   left_padding)) {
+                   left_padding,
+                   kv_offsets)) {
       sdpa_vector_2pass(
-          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding);
+          s,
+          d,
+          q,
+          k,
+          v,
+          o,
+          scale_,
+          csl,
+          ws,
+          mask,
+          sinks,
+          left_padding,
+          kv_offsets);
     }
   }
 

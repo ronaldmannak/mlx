@@ -801,6 +801,121 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     )
                     self.assertTrue(mx.array_equal(padded, fused).item())
 
+    def check_sdpa_kv_offsets(self, n, queries, heads, dtype, *, fused=False):
+        n_heads, n_kv_heads, dim = heads
+        pads = mx.array([3, 11, n // 3], dtype=mx.int32)
+        offsets = mx.array([3, n // 2, n - queries], dtype=mx.int32)
+        q = mx.random.normal((3, n_heads, queries, dim)).astype(dtype)
+        k = mx.random.normal((3, n_kv_heads, n, dim)).astype(dtype)
+        v = mx.random.normal(k.shape).astype(dtype)
+        key = mx.arange(n)
+        pad = pads[:, None, None, None]
+        offset = offsets[:, None, None, None]
+        staged = (key >= pad) & (key < offset + queries)
+        # Use large values outside the staged range to expose stale reads.
+        v = mx.where(staged.swapaxes(-1, -2), v, mx.array(64, dtype=dtype))
+        mask = (key >= pad) & (key <= offset + mx.arange(queries)[:, None])
+        scale = dim**-0.5
+        options = dict(
+            scale=scale, mask="causal", left_padding=pads, kv_offsets=offsets
+        )
+        actual = mx.fast.scaled_dot_product_attention(q, k, v, **options)
+        masked = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+        if fused:
+            forced = mx.fast.scaled_dot_product_attention(
+                q, k, v, force_fused=True, **options
+            )
+            self.assertTrue(mx.array_equal(actual, forced).item())
+            self.assertTrue(mx.allclose(actual, masked, atol=3e-3, rtol=2e-2).item())
+        else:
+            self.assertTrue(mx.array_equal(actual, masked).item())
+        first_key = mx.repeat(v[0, :, 3], n_heads // n_kv_heads, axis=0)
+        self.assertTrue(mx.array_equal(actual[0, :, 0], first_key).item())
+
+    def test_sdpa_kv_offsets_requires_causal_padding(self):
+        q = mx.ones((2, 1, 1, 64))
+        padding = mx.zeros((2,), dtype=mx.int32)
+        for kwargs in (
+            dict(mask="causal", kv_offsets=padding),
+            dict(left_padding=padding, kv_offsets=padding),
+            dict(mask="causal", left_padding=padding, kv_offsets=padding[0]),
+            dict(
+                mask="causal",
+                left_padding=padding,
+                kv_offsets=padding.astype(mx.float32),
+            ),
+        ):
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, "kv_offsets"),
+            ):
+                mx.fast.scaled_dot_product_attention(q, q, q, scale=0.125, **kwargs)
+
+    def test_sdpa_kv_offsets_cpu(self):
+        mx.random.seed(0)
+        with mx.stream(mx.cpu):
+            self.check_sdpa_kv_offsets(41, 3, (8, 2, 64), mx.float32)
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_kv_offsets_metal_vector(self):
+        mx.random.seed(0)
+        # GQA4 uses the two-pass kernel at 4,200 keys on every device.
+        with mx.stream(mx.gpu):
+            for n, queries in product((257, 4200), (1, 4)):
+                with self.subTest(n=n, queries=queries):
+                    self.check_sdpa_kv_offsets(
+                        n, queries, (32, 8, 128), mx.bfloat16, fused=True
+                    )
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_kv_offsets_metal_mask_fallback(self):
+        mx.random.seed(0)
+        # D512, GQA times queries above 32, and the full attention path.
+        cases = [(3, (8, 1, 512)), (8, (64, 8, 128)), (9, (8, 2, 128))]
+        with mx.stream(mx.gpu), mx.config.scoped_update(MLX_SDPA_D512_MIN_KL=1024):
+            for queries, heads in cases:
+                with self.subTest(queries=queries, heads=heads):
+                    self.check_sdpa_kv_offsets(257, queries, heads, mx.bfloat16)
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_kv_offsets_vmap(self):
+        mx.random.seed(0)
+        with mx.stream(mx.gpu):
+            q = mx.random.normal((3, 8, 4, 64))
+            k = mx.random.normal((3, 2, 41, 64))
+            v = mx.random.normal(k.shape)
+            pads = mx.array([[1, 5, 13], [3, 2, 4]], dtype=mx.int32)
+            offsets = mx.array([[3, 14, 13], [16, 10, 4]], dtype=mx.int32)
+
+            def attend(pad, offset):
+                return mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=0.125,
+                    mask="causal",
+                    left_padding=pad,
+                    kv_offsets=offset,
+                )
+
+            key = mx.arange(k.shape[2])
+            query = mx.arange(q.shape[2])[:, None]
+            masked = []
+            for pad, offset in zip(pads, offsets):
+                mask = (key >= pad[:, None, None, None]) & (
+                    key <= offset[:, None, None, None] + query
+                )
+                masked.append(
+                    mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=0.125, mask=mask
+                    )
+                )
+            actual = mx.vmap(attend)(pads, offsets)
+            self.assertTrue(
+                mx.allclose(actual, mx.stack(masked), atol=1e-4, rtol=1e-4).item()
+            )
+
     @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_sdpa_vector_left_padding_shapes(self):
         # Shapes that use the Metal vector kernels with left_padding:

@@ -85,6 +85,25 @@ MLX_API array scaled_dot_product_attention(
     const array& left_padding,
     StreamOrDevice s);
 
+/** Causal SDPA with an int32 [B] array of physical past-KV cursors.
+ * Row b's query j attends to keys in [left_padding[b], kv_offsets[b] + j].
+ * The caller must satisfy 0 <= left_padding[b] <= kv_offsets[b] and
+ * kv_offsets[b] + query_length <= key_length for each row.
+ */
+MLX_API array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const array& left_padding,
+    const array& kv_offsets,
+    StreamOrDevice s);
+
 /** Updates recurrent state with the gated delta rule. */
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,
