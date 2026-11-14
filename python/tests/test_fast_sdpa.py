@@ -798,13 +798,12 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             q, k, v, scale=scale, mask=mask, stream=stream
         )
         msg = f"{dtype} keys {n} queries {query_length} heads {heads}"
-        self.assertTrue(
-            mx.allclose(padded, explicit, rtol=2e-3, atol=2e-3).item(), msg
-        )
+        self.assertTrue(mx.allclose(padded, explicit, rtol=2e-3, atol=2e-3).item(), msg)
         final_query = 1.0 + 15.0 / (n - pads)
         self.assertTrue(
-            mx.allclose(padded[:, :, -1, :], final_query[:, None, None], rtol=1e-2)
-            .item(),
+            mx.allclose(
+                padded[:, :, -1, :], final_query[:, None, None], rtol=1e-2
+            ).item(),
             msg,
         )
         if query_length > 1:
@@ -877,9 +876,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         # single-pass kernel on every device, 1500 keys the two-pass kernel on
         # large devices, and 5000 keys the two-pass kernel on all devices with
         # grouped queries.
-        for (D, V, H, KH), N, L in product(
-            shapes, (40, 1000, 1500, 5000), (1, 3, 8)
-        ):
+        for (D, V, H, KH), N, L in product(shapes, (40, 1000, 1500, 5000), (1, 3, 8)):
             if L * (H // KH) > 32:
                 continue
             # A full row, a row with one key, and one in between.
