@@ -1970,10 +1970,32 @@ void ScaledDotProductAttention::eval_gpu(
       // single-pass kernel cannot launch, every row uses two-pass, as it
       // would alone.
       bool single_pass = sdpa_vector(
-          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding,
+          s,
+          d,
+          q,
+          k,
+          v,
+          o,
+          scale_,
+          csl,
+          ws,
+          mask,
+          sinks,
+          left_padding,
           min_keys);
       sdpa_vector_2pass(
-          s, d, q, k, v, o, scale_, csl, ws, mask, sinks, left_padding,
+          s,
+          d,
+          q,
+          k,
+          v,
+          o,
+          scale_,
+          csl,
+          ws,
+          mask,
+          sinks,
+          left_padding,
           single_pass ? min_keys : 0);
     } else if (two_pass) {
       sdpa_vector_2pass(

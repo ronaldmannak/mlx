@@ -658,7 +658,8 @@ template <typename T, int D>
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
     const constant int& blocks [[buffer(4)]],
-    const device int* left_padding [[buffer(5), function_constant(filter_rows)]],
+    const device int* left_padding
+    [[buffer(5), function_constant(filter_rows)]],
     const constant int& N [[buffer(6), function_constant(filter_rows)]],
     const constant int& num_q_heads
     [[buffer(7), function_constant(filter_rows)]],
