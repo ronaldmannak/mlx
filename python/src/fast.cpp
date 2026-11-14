@@ -378,11 +378,14 @@ void init_fast(nb::module_& parent_module) {
                last query aligns with the last key.
             left_padding (array, optional): An int32 array of shape ``[B]``
                containing the number of leading padded keys and values in each
-               row. Each row must have at least one unpadded key. Cannot be
-               combined with ``mask``, ``window_size``, or ``sinks`` and
-               is unavailable in shapeless tracing.
-               On Metal, queries of up to 8 tokens skip these positions
-               without reading them. Other cases use a boolean mask.
+               row. Each count must satisfy ``0 <= count < N``, where ``N``
+               is the key length. Counts are not checked, and results for
+               counts outside that range are unspecified. Cannot be combined
+               with ``mask``, ``window_size``, or ``sinks`` and is
+               unavailable in shapeless tracing. On Metal, eligible shapes
+               with up to 8 query tokens skip the padded positions without
+               reading them. Other cases apply a boolean mask built from the
+               counts.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
             force_fused (bool, optional): If ``True``, use a fused kernel

@@ -64,8 +64,10 @@ MLX_API array scaled_dot_product_attention(
     bool force_fused = false,
     StreamOrDevice s = {});
 
-/** SDPA with an int32 [B] array of left-padding counts for keys and values.
- * Each row must keep at least one key. Cannot be combined with another mask,
+/** SDPA with an int32 [B] array of left-padding counts: row b ignores its
+ * first left_padding[b] keys and values. Each count must satisfy
+ * 0 <= count < key length. Counts are not checked, and results for counts
+ * outside that range are unspecified. Cannot be combined with another mask,
  * a window, or sinks. Not supported in shapeless tracing.
  */
 MLX_API array scaled_dot_product_attention(
