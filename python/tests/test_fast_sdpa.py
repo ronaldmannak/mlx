@@ -641,6 +641,10 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
     def test_sdpa_vector_left_padding_preserves_logical_block_order(self):
         # Zero queries and keys give uniform attention. The three nonzero
         # values make BF16 output sensitive to rotation of the block partials.
+        # The padded batch (4,245 keys) and the solo row (4,144 keys) both use
+        # the two-pass kernel with the same fixed block count, so the padded
+        # row must reproduce the solo row exactly. Rows that use a different
+        # kernel or block count alone are not covered by this guarantee.
         with mx.stream(mx.gpu), mx.config.scoped_update(MLX_SDPA_BLOCKS=64):
             n = 4245
             pad = 101
@@ -695,6 +699,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
 
     @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_sdpa_vector_left_padding_shapes(self):
+        # Shapes that use the Metal vector kernels with left_padding:
         # (query dim, value dim, query heads, key/value heads)
         shapes = [
             (64, 64, 4, 4),
@@ -705,16 +710,18 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             (128, 128, 24, 2),
             (128, 128, 32, 2),
             (192, 128, 8, 4),
-            (192, 192, 4, 2),
             (256, 256, 8, 1),
-            (512, 512, 8, 1),
         ]
         tolerances = {mx.float32: 1e-4, mx.float16: 2e-3, mx.bfloat16: 2e-2}
         mx.random.seed(0)
-        # 40 keys leave simdgroups and blocks without any; 1500 and 5000 reach
-        # the two-pass kernel on large and on all devices.
-        for (D, V, H, KH), N, L in product(shapes, (40, 1500, 5000), (1, 3, 16)):
-            if L <= 8 and L * (H // KH) > 32:
+        # 40 keys leave simdgroups and blocks without any. 1000 keys use the
+        # single-pass kernel on every device, 1500 keys the two-pass kernel on
+        # large devices, and 5000 keys the two-pass kernel on all devices with
+        # grouped queries.
+        for (D, V, H, KH), N, L in product(
+            shapes, (40, 1000, 1500, 5000), (1, 3, 8)
+        ):
+            if L * (H // KH) > 32:
                 continue
             # A full row, a row with one key, and one in between.
             pads = mx.array([0, N - 1, N // 3])
@@ -726,23 +733,76 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             k32 = mx.random.normal((3, KH, N, D))
             v32 = mx.random.normal((3, KH, N, V))
             for dtype, tol in tolerances.items():
+                msg = f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}"
                 q, k, v = (x.astype(dtype) for x in (q32, k32, v32))
+                # force_fused fails instead of silently using the mask fallback.
+                fused = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=scale,
+                    left_padding=pads,
+                    force_fused=True,
+                    stream=mx.gpu,
+                )
                 padded = mx.fast.scaled_dot_product_attention(
                     q, k, v, scale=scale, left_padding=pads, stream=mx.gpu
                 )
                 masked = mx.fast.scaled_dot_product_attention(
                     q, k, v, scale=scale, mask=mask, stream=mx.gpu
                 )
+                # The default dispatch picks the same vector kernel.
+                self.assertTrue(mx.array_equal(padded, fused).item(), msg)
                 self.assertTrue(
-                    mx.allclose(padded, masked, atol=tol, rtol=tol).item(),
-                    f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}",
+                    mx.allclose(padded, masked, atol=tol, rtol=tol).item(), msg
                 )
                 # The row with one key attends only to it.
                 last = mx.repeat(v[1, :, -1], H // KH, axis=0)[:, None]
                 self.assertTrue(
-                    mx.allclose(padded[1], last, atol=tol, rtol=tol).item(),
-                    f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}",
+                    mx.allclose(padded[1], last, atol=tol, rtol=tol).item(), msg
                 )
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_left_padding_mask_fallback_shapes(self):
+        # Shapes that use the boolean mask built from the counts, so they must
+        # match an explicit mask exactly. Head dimension 192 with matching
+        # values and head dimension 512 stay off the vector kernels; more than
+        # 8 queries use full attention.
+        cases = [
+            ((192, 192, 4, 2), 3),
+            ((512, 512, 8, 1), 1),
+            ((512, 512, 8, 1), 3),
+            ((64, 64, 4, 4), 16),
+            ((128, 128, 8, 2), 16),
+        ]
+        mx.random.seed(0)
+        for ((D, V, H, KH), L), N in product(cases, (40, 1500)):
+            pads = mx.array([0, N - 1, N // 3])
+            mask = mx.arange(N) >= pads[:, None, None, None]
+            scale = 4 * D**-0.5
+            for dtype in (mx.float32, mx.bfloat16):
+                msg = f"{dtype} dims {D}/{V} heads {H}/{KH} keys {N} queries {L}"
+                q = mx.random.normal((3, H, L, D)).astype(dtype)
+                k = mx.random.normal((3, KH, N, D)).astype(dtype)
+                v = mx.random.normal((3, KH, N, V)).astype(dtype)
+                padded = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, left_padding=pads, stream=mx.gpu
+                )
+                masked = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=mask, stream=mx.gpu
+                )
+                self.assertTrue(mx.array_equal(padded, masked).item(), msg)
+            if D == 512:
+                with self.assertRaisesRegex(ValueError, "force_fused"):
+                    mx.fast.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        scale=scale,
+                        left_padding=pads,
+                        force_fused=True,
+                        stream=mx.gpu,
+                    )
 
     @unittest.skipIf(not mx.is_available(mx.gpu), "too slow on CPU")
     @unittest.skipIf(mx.cuda.is_available() and "CI" in os.environ, "not enough memory")
