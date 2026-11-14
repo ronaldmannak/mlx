@@ -275,14 +275,18 @@ class ScaledDotProductAttention : public Custom {
       bool has_sinks,
       int window_size,
       bool output_logsumexp,
-      bool force_fused)
+      bool force_fused,
+      bool has_left_padding = false,
+      bool has_kv_offsets = false)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
         window_size_(window_size),
         output_logsumexp_(output_logsumexp),
-        force_fused_(force_fused) {}
+        force_fused_(force_fused),
+        has_left_padding_(has_left_padding),
+        has_kv_offsets_(has_kv_offsets) {}
 
   static bool use_fallback(
       const array& q,
@@ -335,6 +339,9 @@ class ScaledDotProductAttention : public Custom {
   int window_size_;
   bool output_logsumexp_;
   bool force_fused_;
+  // The fourth input holds int32 left-padding counts instead of a mask.
+  bool has_left_padding_;
+  bool has_kv_offsets_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {

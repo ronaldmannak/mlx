@@ -266,7 +266,58 @@ void init_fast(nb::module_& parent_module) {
          const std::variant<std::monostate, std::string, mx::array>& mask,
          const std::optional<mx::array>& sinks,
          bool force_fused,
+         const std::optional<mx::array>& left_padding,
+         const std::optional<mx::array>& kv_offsets,
          mx::StreamOrDevice s) {
+        auto attend = [&](const std::string& mask_mode,
+                          const std::optional<mx::array>& mask_arr) {
+          if (kv_offsets) {
+            if (!left_padding) {
+              throw std::invalid_argument(
+                  "[scaled_dot_product_attention] kv_offsets requires causal "
+                  "masking and left_padding.");
+            }
+            return mx::fast::scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale,
+                window_size,
+                mask_mode,
+                mask_arr,
+                sinks,
+                force_fused,
+                *left_padding,
+                *kv_offsets,
+                s);
+          }
+          if (left_padding) {
+            return mx::fast::scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale,
+                window_size,
+                mask_mode,
+                mask_arr,
+                sinks,
+                force_fused,
+                *left_padding,
+                s);
+          }
+          return mx::fast::scaled_dot_product_attention(
+              queries,
+              keys,
+              values,
+              scale,
+              window_size,
+              mask_mode,
+              mask_arr,
+              sinks,
+              force_fused,
+              s);
+        };
+
         bool has_mask = !std::holds_alternative<std::monostate>(mask);
         bool has_str_mask =
             has_mask && std::holds_alternative<std::string>(mask);
@@ -281,44 +332,14 @@ void init_fast(nb::module_& parent_module) {
                   << mask_str << "'. Must be 'causal', or an array.";
               throw std::invalid_argument(msg.str());
             }
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                mask_str,
-                std::nullopt,
-                sinks,
-                force_fused,
-                s);
+            return attend(mask_str, std::nullopt);
           } else {
             auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                "",
-                mask_arr,
-                sinks,
-                force_fused,
-                s);
+            return attend("", mask_arr);
           }
 
         } else {
-          return mx::fast::scaled_dot_product_attention(
-              queries,
-              keys,
-              values,
-              scale,
-              window_size,
-              "",
-              {},
-              sinks,
-              force_fused,
-              s);
+          return attend("", {});
         }
       },
       "q"_a,
@@ -330,9 +351,11 @@ void init_fast(nb::module_& parent_module) {
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
       "force_fused"_a = false,
+      "left_padding"_a = nb::none(),
+      "kv_offsets"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, left_padding: array | None = None, kv_offsets: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -375,6 +398,24 @@ void init_fast(nb::module_& parent_module) {
                type must promote to the promoted type of ``q``, ``k``, and ``v``.
                The ``"causal"`` mask uses lower-right alignment where the
                last query aligns with the last key.
+            left_padding (array, optional): An int32 array of shape ``[B]``
+               containing the number of leading padded keys and values in each
+               row. Each count must satisfy ``0 <= count < T_kv``. With
+               ``mask="causal"``, each row must also keep at least as many
+               keys as queries: ``count <= T_kv - T_q``. Counts are not
+               checked, and results for counts outside that range are
+               unspecified. Cannot be combined with an array ``mask``,
+               ``window_size``, or ``sinks`` and is unavailable in shapeless
+               tracing. On Metal, eligible shapes with up to 8 queries skip
+               the padded positions without reading them. Other cases apply
+               a boolean mask built from the counts.
+            kv_offsets (array, optional): An int32 array of shape ``[B]``
+               containing each row's physical KV cursor before the query block.
+               Requires ``mask="causal"`` and ``left_padding``. Query ``j``
+               attends to keys from ``left_padding[b]`` through
+               ``kv_offsets[b] + j``, inclusive. Each cursor must be at
+               least its row's left-padding count and no greater than
+               ``T_kv - T_q``. Cursor values are not checked.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
             force_fused (bool, optional): If ``True``, use a fused kernel

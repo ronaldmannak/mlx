@@ -12,7 +12,10 @@ constant bool float_mask [[function_constant(24)]];
 constant bool has_sinks [[function_constant(25)]];
 constant int blocks [[function_constant(26)]];
 constant int window_size [[function_constant(27)]];
+constant bool has_left_padding [[function_constant(28)]];
+constant bool has_kv_offsets [[function_constant(29)]];
 constant bool has_window = window_size > 0;
+constant bool has_row_heads = has_sinks || has_left_padding;
 
 // Visible keys [lo, hi) of the query at position pos
 METAL_FUNC int2 window_range(int pos, int N) {
@@ -45,7 +48,11 @@ template <typename T, int D, int V = D>
     [[buffer(15), function_constant(has_mask)]],
     const device T* sinks [[buffer(16), function_constant(has_sinks)]],
     const constant int& num_q_heads
-    [[buffer(17), function_constant(has_sinks)]],
+    [[buffer(17), function_constant(has_row_heads)]],
+    const device int* left_padding
+    [[buffer(18), function_constant(has_left_padding)]],
+    const device int* kv_offsets
+    [[buffer(19), function_constant(has_kv_offsets)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -72,13 +79,28 @@ template <typename T, int D, int V = D>
   const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
   const int kv_seq_idx = simd_gid;
+  // Skip the left-padded keys of this row: simdgroup g starts at the row's
+  // g-th valid key instead of the g-th stored key.
+  int first_key = simd_gid;
+  int read_start = simd_gid;
+  int key_limit = N;
+  if (has_left_padding) {
+    const int row = q_batch_head_idx / num_q_heads;
+    const int pad = clamp(left_padding[row], 0, N);
+    if (has_kv_offsets) {
+      key_limit = clamp(kv_offsets[row], 0, N - q_seq_idx - 1) + q_seq_idx + 1;
+    }
+    first_key = pad + min(int(simd_gid), max(0, key_limit - pad));
+    // A simdgroup without keys must not point past the end of K/V.
+    read_start = min(first_key, N - 1);
+  }
   const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
   const int q_offset =
       query_transposed ? tpg.x * q_seq_idx + q_batch_head_idx : o_offset;
   queries += q_offset * D + simd_lid * qk_per_thread;
-  keys += kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+  keys += kv_head_idx * k_head_stride + read_start * k_seq_stride +
       simd_lid * qk_per_thread;
-  values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+  values += kv_head_idx * v_head_stride + read_start * v_seq_stride +
       simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
@@ -93,7 +115,7 @@ template <typename T, int D, int V = D>
 
   // Restrict the keys to the window
   int lo = 0;
-  int hi = N;
+  int hi = key_limit;
   if (has_window) {
     // Offset = kL - qL = N - tpg.y
     auto range = window_range(N - int(tpg.y) + int(q_seq_idx), N);
@@ -127,9 +149,9 @@ template <typename T, int D, int V = D>
   }
 
   // For each key in valid range
-  for (int i = lo + simd_gid; i < hi; i += BN) {
+  for (int i = lo + first_key; i < hi; i += BN) {
     bool use_key = true;
-    if (do_causal) {
+    if (do_causal && !has_kv_offsets) {
       use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
     }
 
@@ -233,6 +255,10 @@ template <typename T, int D, int V = D, int TK = 4>
     const constant int& mask_head_stride
     [[buffer(17), function_constant(has_mask)]],
     const device T* sinks [[buffer(18), function_constant(has_sinks)]],
+    const device int* left_padding
+    [[buffer(19), function_constant(has_left_padding)]],
+    const device int* kv_offsets
+    [[buffer(20), function_constant(has_kv_offsets)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -264,10 +290,26 @@ template <typename T, int D, int V = D, int TK = 4>
 
   queries += q_offset * D + simd_lid * qk_per_thread;
 
+  // Skip the left-padded keys of this row: block b starts at the row's b-th
+  // valid key instead of the b-th stored key.
+  int first_key = block_idx;
+  int read_start = block_idx;
+  int key_limit = N;
+  if (has_left_padding) {
+    const int pad = clamp(left_padding[batch_idx], 0, N);
+    if (has_kv_offsets) {
+      key_limit = clamp(kv_offsets[batch_idx], 0, N - int(q_seq_idx) - 1) +
+          int(q_seq_idx) + 1;
+    }
+    first_key = pad + min(block_idx, max(0, key_limit - pad));
+    // Empty blocks still write zero partials but must not read any K/V.
+    read_start = min(first_key, N - 1);
+  }
+
   const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
-  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
+  keys += kv_batch_head_idx * k_head_stride + read_start * k_seq_stride +
       simd_lid * qk_per_thread;
-  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+  values += kv_batch_head_idx * v_head_stride + read_start * v_seq_stride +
       simd_lid * v_per_thread;
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   if (bool_mask) {
@@ -299,7 +341,7 @@ template <typename T, int D, int V = D, int TK = 4>
       (bool_mask || float_mask) ? blocks * mask_kv_seq_stride : 0;
 
   // For each key
-  int i = block_idx;
+  int i = first_key;
 
   // Prepare for windows
   int lo = 0;
@@ -339,7 +381,7 @@ template <typename T, int D, int V = D, int TK = 4>
   }
 
   // For each key
-  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+  for (; i + (TK - 1) * blocks < key_limit; i += blocks * TK) {
     // Prefetch: issue all TK K/V loads first so the HW can overlap them.
     T k_reg[TK][qk_per_thread];
     T v_reg[TK][v_per_thread];
@@ -361,7 +403,7 @@ template <typename T, int D, int V = D, int TK = 4>
       bool use_key = true;
       if (has_window) {
         use_key = (ii >= lo) && (ii < hi);
-      } else if (do_causal) {
+      } else if (do_causal && !has_kv_offsets) {
         use_key = ii <= (N - q_seq_len + int(q_seq_idx));
       }
 
@@ -404,11 +446,11 @@ template <typename T, int D, int V = D, int TK = 4>
   }
 
   // Tail (fewer than TK remaining keys)
-  for (; i < N; i += blocks) {
+  for (; i < key_limit; i += blocks) {
     bool use_key = true;
     if (has_window) {
       use_key = (i >= lo) && (i < hi);
-    } else if (do_causal) {
+    } else if (do_causal && !has_kv_offsets) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
     }
 

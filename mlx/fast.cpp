@@ -2,6 +2,7 @@
 #include <cassert>
 #include <numeric>
 
+#include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -710,18 +711,38 @@ bool RoPE::is_equivalent(const Primitive& other) const {
       forward_ == a_other.forward_);
 }
 
+static array
+left_padding_mask(const array& counts, int key_length, StreamOrDevice s) {
+  return greater_equal(
+      arange(key_length, s), reshape(counts, {counts.shape(0), 1, 1, 1}, s), s);
+}
+
+static array causal_mask_from_kv_offsets(
+    const array& offsets,
+    int query_length,
+    int key_length,
+    StreamOrDevice s) {
+  auto query_positions =
+      add(reshape(offsets, {offsets.shape(0), 1, 1, 1}, s),
+          expand_dims(arange(query_length, s), -1, s),
+          s);
+  return greater_equal(query_positions, arange(key_length, s), s);
+}
+
 /** Computes: O = softmax(Q @ K.T) @ V **/
-array scaled_dot_product_attention(
+static array scaled_dot_product_attention_impl(
     const array& queries,
     const array& keys,
     const array& values,
     const float scale,
-    int window_size /* = -1 */,
-    const std::string& mask_mode /* = "" */,
-    std::optional<array> mask_arr /* = {} */,
-    const std::optional<array>& sinks /* = {} */,
-    bool force_fused /* = false */,
-    StreamOrDevice s /* = {} */) {
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const std::optional<array>& left_padding,
+    const std::optional<array>& kv_offsets,
+    StreamOrDevice s) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -737,6 +758,52 @@ array scaled_dot_product_attention(
     throw std::invalid_argument(msg.str());
   }
   bool has_window = window_size > 0;
+  // Padding hides keys on the left and causality hides later queries' keys
+  // on the right, so the two combine without conflict.
+  const bool causal_with_left_padding = left_padding && mask_mode == "causal";
+
+  if (kv_offsets) {
+    if (!causal_with_left_padding) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] kv_offsets requires causal masking "
+          "and left_padding.");
+    }
+    if (kv_offsets->dtype() != int32 ||
+        kv_offsets->shape() != Shape{queries.shape(0)}) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] kv_offsets must be an int32 "
+          "array of shape [B].");
+    }
+  }
+  if (left_padding) {
+    if (detail::in_dynamic_tracing()) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding does not support "
+          "shapeless tracing.");
+    }
+    if ((!mask_mode.empty() && !causal_with_left_padding) || mask_arr ||
+        has_window || sinks) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding cannot be combined "
+          "with an array mask, window, or sinks.");
+    }
+    if (left_padding->dtype() != int32 ||
+        left_padding->shape() != Shape{queries.shape(0)}) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding must be an int32 "
+          "array of shape [B].");
+    }
+    if (keys.shape(2) == 0 || keys.shape(2) != values.shape(2)) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] left_padding requires nonempty "
+          "keys and values with matching sequence lengths.");
+    }
+    if (causal_with_left_padding && queries.shape(2) > keys.shape(2)) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] causal left_padding requires at "
+          "least as many valid keys as queries in every row.");
+    }
+  }
 
   // Check valid mask
   if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
@@ -751,7 +818,7 @@ array scaled_dot_product_attention(
   bool has_arr_mask = false;
   bool has_bool_mask = false;
 
-  if (mask_mode == "causal") {
+  if (mask_mode == "causal" && !causal_with_left_padding) {
     has_mask = true;
     do_causal = true;
 
@@ -825,14 +892,55 @@ array scaled_dot_product_attention(
   auto k = astype(keys, final_type, s);
   auto v = astype(values, final_type, s);
 
+  auto stream = to_stream(s);
+  bool is_training = detail::in_grad_tracing();
+  // Keep counts and cursors as operands on the Metal vector path.
+  const bool skip_left_padding = left_padding && !is_training &&
+      !detail::in_export_tracing() && stream.device == Device::gpu &&
+      metal::is_available() && q.shape(2) <= 8;
+  if (left_padding) {
+    has_mask = has_arr_mask = has_bool_mask = true;
+    if (!skip_left_padding) {
+      const int key_length = k.shape(2);
+      mask_arr = left_padding_mask(*left_padding, key_length, stream);
+      if (kv_offsets) {
+        mask_arr = logical_and(
+            *mask_arr,
+            causal_mask_from_kv_offsets(
+                *kv_offsets, q.shape(2), key_length, stream),
+            stream);
+      } else if (causal_with_left_padding && q.shape(2) > 1) {
+        auto query_positions = expand_dims(
+            arange(key_length - q.shape(2), key_length, stream), 1, stream);
+        mask_arr = logical_and(
+            *mask_arr,
+            greater_equal(query_positions, arange(key_length, stream), stream),
+            stream);
+      }
+    }
+  }
+  const bool fused_causal =
+      do_causal || (causal_with_left_padding && skip_left_padding);
+  const bool has_kv_offsets = skip_left_padding && kv_offsets.has_value();
+
   auto fallback = [scale,
                    n_q_heads,
                    n_kv_heads,
-                   do_causal,
+                   do_causal = fused_causal,
                    window_size,
                    has_sinks,
                    has_arr_mask,
+                   padding_counts = skip_left_padding,
+                   has_kv_offsets,
                    s](const std::vector<array>& inputs) {
+    // inputs[3] is either the array mask or, on the vector path, the
+    // left-padding counts the mask is built from.
+    auto arr_mask_input = [&]() {
+      if (!padding_counts) {
+        return inputs[3];
+      }
+      return left_padding_mask(inputs[3], inputs[1].shape(-2), s);
+    };
     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
     auto k = inputs[1];
@@ -846,6 +954,10 @@ array scaled_dot_product_attention(
     if (has_arr_mask || do_causal || window_size > 0) {
       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
       auto make_or_fetch_mask = [&]() {
+        if (has_kv_offsets) {
+          return causal_mask_from_kv_offsets(
+              inputs[4], q.shape(-2), k.shape(-2), s);
+        }
         if (do_causal || window_size > 0) {
           int kL = k.shape(-2);
           int qL = q.shape(-2);
@@ -869,13 +981,13 @@ array scaled_dot_product_attention(
 
           return greater_equal(q_idx, k_idx, s);
         }
-        return inputs[3];
+        return arr_mask_input();
       };
       auto mask = make_or_fetch_mask();
 
       // If we have an array mask on top of a built mask
       if ((do_causal || window_size > 0) && has_arr_mask) {
-        auto arr_mask = inputs[3];
+        auto arr_mask = arr_mask_input();
 
         if (arr_mask.dtype() == bool_) {
           mask = logical_and(mask, arr_mask, s);
@@ -925,9 +1037,15 @@ array scaled_dot_product_attention(
     return std::vector<array>{out};
   };
 
-  auto stream = to_stream(s);
   std::vector<array> inputs = {q, k, v};
-  if (has_arr_mask) {
+  if (skip_left_padding) {
+    // The vector kernels read the counts directly, and the fallback rebuilds
+    // the mask from them, so the mask is never materialized on this path.
+    inputs.push_back(contiguous(*left_padding, false, stream));
+    if (has_kv_offsets) {
+      inputs.push_back(contiguous(*kv_offsets, false, stream));
+    }
+  } else if (has_arr_mask) {
     // Check type
     has_bool_mask = mask_arr->dtype() == bool_;
     if (promote_types(mask_arr->dtype(), final_type) != final_type) {
@@ -959,7 +1077,6 @@ array scaled_dot_product_attention(
     inputs.push_back(astype(*sinks, final_type, stream));
   }
 
-  bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
   bool output_logsumexp = is_training && has_fast_vjp;
   if (!ScaledDotProductAttention::use_fallback(
@@ -975,7 +1092,8 @@ array scaled_dot_product_attention(
           output_logsumexp,
           force_fused,
           stream)) {
-    if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
+    if (has_bool_mask && !skip_left_padding &&
+        !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
       array& mask = inputs[3];
@@ -990,11 +1108,13 @@ array scaled_dot_product_attention(
         stream,
         fallback,
         scale,
-        do_causal,
+        fused_causal,
         has_sinks,
         window_size,
         output_logsumexp,
-        force_fused);
+        force_fused,
+        skip_left_padding,
+        has_kv_offsets);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1007,6 +1127,87 @@ array scaled_dot_product_attention(
     }
   }
   return fallback(std::move(inputs))[0];
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size /* = -1 */,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    bool force_fused /* = false */,
+    StreamOrDevice s /* = {} */) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      window_size,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      std::nullopt,
+      std::nullopt,
+      s);
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const array& left_padding,
+    StreamOrDevice s) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      window_size,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      left_padding,
+      std::nullopt,
+      s);
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    const array& left_padding,
+    const array& kv_offsets,
+    StreamOrDevice s) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      window_size,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      left_padding,
+      kv_offsets,
+      s);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(
@@ -1065,7 +1266,9 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_ &&
       window_size_ == a_other.window_size_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
-      force_fused_ == a_other.force_fused_;
+      force_fused_ == a_other.force_fused_ &&
+      has_left_padding_ == a_other.has_left_padding_ &&
+      has_kv_offsets_ == a_other.has_kv_offsets_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
