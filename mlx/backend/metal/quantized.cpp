@@ -2293,6 +2293,31 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
 
   if (transpose_) {
+    // Keep the standalone four-query reduction when combining Qwen rows.
+    if (config::get("MLX_QUANTIZED_MATMUL_SOLO_Q4_WIDE", 0) && non_batched &&
+        x.ndim() == 3 && x.shape(0) >= 2 && x.shape(0) <= 4 &&
+        x.shape(-2) == 4 && x.dtype() == bfloat16 &&
+        mode_ == QuantizationMode::Affine && group_size_ == 64 && bits_ == 4 &&
+        (K == 4096 || K == 12288) &&
+        (N == 1024 || N == 4096 || N == 12288 || N == 151936) &&
+        d.get_architecture_gen() == 17 && d.get_architecture().back() == 's' &&
+        metal::is_nax_available() && use_qmv_wide("affine", d)) {
+      qmv_wide(
+          x,
+          w,
+          scales,
+          biases,
+          out,
+          group_size_,
+          bits_,
+          M,
+          N,
+          K,
+          d,
+          s,
+          "affine");
+      return;
+    }
     dispatch_qmm_t(
         x,
         w,
