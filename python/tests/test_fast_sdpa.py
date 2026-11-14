@@ -676,6 +676,29 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.array_equal(padded, solo).item())
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_left_padding_vmap(self):
+        # vmap runs the primitive's fallback, which rebuilds the padding mask
+        # from the counts the vector path keeps as its only mask operand.
+        mx.random.seed(0)
+        # The last row keeps exactly as many keys as queries.
+        pads = mx.array([0, 5, 37], dtype=mx.int32)
+        q = mx.random.normal((2, 3, 8, 3, 64))
+        k = mx.random.normal((2, 3, 2, 40, 64))
+        v = mx.random.normal((2, 3, 2, 40, 64))
+        for mask in (None, "causal"):
+
+            def attend(q, k, v):
+                return mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=0.125, mask=mask, left_padding=pads
+                )
+
+            mapped = mx.vmap(attend)(q, k, v)
+            looped = mx.stack([attend(q[i], k[i], v[i]) for i in range(2)])
+            self.assertTrue(
+                mx.allclose(mapped, looped, atol=1e-4, rtol=1e-4).item(), mask
+            )
+
     def test_sdpa_left_padding_mask_fallback(self):
         with mx.stream(mx.cpu):
             q = mx.ones((2, 2, 2, 4))

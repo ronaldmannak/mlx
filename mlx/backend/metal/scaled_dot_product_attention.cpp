@@ -1804,13 +1804,12 @@ void ScaledDotProductAttention::eval_gpu(
   if (has_sinks_) {
     sinks = copy_unless(is_matrix_contiguous, inputs.back());
   }
+  // With left padding, inputs[3] holds the per-row counts instead of a mask.
+  // Only the vector kernels receive it; it still counts as an array mask so
+  // the split kernel, which ignores masks, is never chosen.
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
-  // An extra operand after the mask carries the left-padding count of each
-  // row. Only the vector kernels read it; the mask at inputs[3] hides the same
-  // keys for every other path.
-  auto left_padding = !has_sinks_ && inputs.size() == 5
-      ? std::optional<array>{inputs[4]}
-      : std::nullopt;
+  auto left_padding = has_left_padding_ ? std::optional<array>{inputs[3]}
+                                        : std::nullopt;
 
   auto set_transposed_output = [&o]() {
     int64_t str_oD = 1;

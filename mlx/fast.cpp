@@ -880,8 +880,8 @@ static array scaled_dot_product_attention_impl(
     const auto causal_mask = greater_equal(q_pos, arange(kL, stream), stream);
     mask_arr = logical_and(*mask_arr, causal_mask, stream);
   }
-  // On the vector path the compact padding mask stays an operand for graph
-  // transforms, and the fallback applies causality on top of it.
+  // On the vector path the fallback rebuilds the padding mask from the counts
+  // and applies causality on top of it.
   const bool fused_causal =
       do_causal || (causal_with_left_padding && skip_left_padding);
 
@@ -892,7 +892,17 @@ static array scaled_dot_product_attention_impl(
                    window_size,
                    has_sinks,
                    has_arr_mask,
+                   padding_counts = skip_left_padding,
                    s](const std::vector<array>& inputs) {
+    // inputs[3] is either the array mask or, on the vector path, the
+    // left-padding counts the mask is built from.
+    auto arr_mask_input = [&]() {
+      if (!padding_counts) {
+        return inputs[3];
+      }
+      auto counts = reshape(inputs[3], {inputs[3].shape(0), 1, 1, 1}, s);
+      return greater_equal(arange(inputs[1].shape(-2), s), counts, s);
+    };
     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
     auto k = inputs[1];
@@ -929,13 +939,13 @@ static array scaled_dot_product_attention_impl(
 
           return greater_equal(q_idx, k_idx, s);
         }
-        return inputs[3];
+        return arr_mask_input();
       };
       auto mask = make_or_fetch_mask();
 
       // If we have an array mask on top of a built mask
       if ((do_causal || window_size > 0) && has_arr_mask) {
-        auto arr_mask = inputs[3];
+        auto arr_mask = arr_mask_input();
 
         if (arr_mask.dtype() == bool_) {
           mask = logical_and(mask, arr_mask, s);
@@ -986,7 +996,11 @@ static array scaled_dot_product_attention_impl(
   };
 
   std::vector<array> inputs = {q, k, v};
-  if (has_arr_mask) {
+  if (skip_left_padding) {
+    // The vector kernels read the counts directly, and the fallback rebuilds
+    // the mask from them, so the mask is never materialized on this path.
+    inputs.push_back(contiguous(*left_padding, false, stream));
+  } else if (has_arr_mask) {
     // Check type
     has_bool_mask = mask_arr->dtype() == bool_;
     if (promote_types(mask_arr->dtype(), final_type) != final_type) {
@@ -1033,7 +1047,8 @@ static array scaled_dot_product_attention_impl(
           output_logsumexp,
           force_fused,
           stream)) {
-    if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
+    if (has_bool_mask && !skip_left_padding &&
+        !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
       array& mask = inputs[3];
@@ -1042,10 +1057,6 @@ static array scaled_dot_product_attention_impl(
           full_like(mask, 0, final_type, stream),
           full_like(mask, -inf, final_type, stream),
           stream);
-    }
-    if (skip_left_padding) {
-      // Keep the mask operand for graph transforms using the fallback.
-      inputs.push_back(contiguous(*left_padding, false, stream));
     }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
@@ -1056,7 +1067,8 @@ static array scaled_dot_product_attention_impl(
         has_sinks,
         window_size,
         output_logsumexp,
-        force_fused);
+        force_fused,
+        skip_left_padding);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1178,7 +1190,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_ &&
       window_size_ == a_other.window_size_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
-      force_fused_ == a_other.force_fused_;
+      force_fused_ == a_other.force_fused_ &&
+      has_left_padding_ == a_other.has_left_padding_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
