@@ -816,7 +816,9 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         v = mx.where(staged.swapaxes(-1, -2), v, mx.array(64, dtype=dtype))
         mask = (key >= pad) & (key <= offset + mx.arange(queries)[:, None])
         scale = dim**-0.5
-        options = dict(scale=scale, mask="causal", left_padding=pads, kv_offsets=offsets)
+        options = dict(
+            scale=scale, mask="causal", left_padding=pads, kv_offsets=offsets
+        )
         actual = mx.fast.scaled_dot_product_attention(q, k, v, **options)
         masked = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
@@ -838,7 +840,11 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             dict(mask="causal", kv_offsets=padding),
             dict(left_padding=padding, kv_offsets=padding),
             dict(mask="causal", left_padding=padding, kv_offsets=padding[0]),
-            dict(mask="causal", left_padding=padding, kv_offsets=padding.astype(mx.float32)),
+            dict(
+                mask="causal",
+                left_padding=padding,
+                kv_offsets=padding.astype(mx.float32),
+            ),
         ):
             with (
                 self.subTest(kwargs=kwargs),
@@ -884,7 +890,13 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
 
             def attend(pad, offset):
                 return mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=0.125, mask="causal", left_padding=pad, kv_offsets=offset
+                    q,
+                    k,
+                    v,
+                    scale=0.125,
+                    mask="causal",
+                    left_padding=pad,
+                    kv_offsets=offset,
                 )
 
             key = mx.arange(k.shape[2])
