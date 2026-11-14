@@ -14,6 +14,7 @@ constant int blocks [[function_constant(26)]];
 constant int window_size [[function_constant(27)]];
 constant bool has_left_padding [[function_constant(28)]];
 constant bool has_kv_offsets [[function_constant(29)]];
+constant bool match_solo_rows [[function_constant(30)]];
 constant bool has_window = window_size > 0;
 constant bool has_row_heads = has_sinks || has_left_padding;
 
@@ -23,6 +24,17 @@ METAL_FUNC int2 window_range(int pos, int N) {
   int hi = do_causal ? (pos + 1) : (pos + window_size);
   hi = min(N, hi);
   return int2(lo, hi);
+}
+
+METAL_FUNC int row_staged_end(int past, int N, int query_length) {
+  past = clamp(past, 0, N);
+  return past + min(query_length, N - past);
+}
+
+METAL_FUNC bool row_matches_length_range(
+    int width,
+    const constant int2& row_lengths) {
+  return width >= row_lengths.x && width < row_lengths.y;
 }
 
 template <typename T, int D, int V = D>
@@ -53,6 +65,8 @@ template <typename T, int D, int V = D>
     [[buffer(18), function_constant(has_left_padding)]],
     const device int* kv_offsets
     [[buffer(19), function_constant(has_kv_offsets)]],
+    const constant int2& row_lengths
+    [[buffer(20), function_constant(match_solo_rows)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -84,13 +98,21 @@ template <typename T, int D, int V = D>
   int first_key = simd_gid;
   int read_start = simd_gid;
   int key_limit = N;
+  int loop_limit = N;
   if (has_left_padding) {
     const int row = q_batch_head_idx / num_q_heads;
     const int pad = clamp(left_padding[row], 0, N);
     if (has_kv_offsets) {
       key_limit = clamp(kv_offsets[row], 0, N - q_seq_idx - 1) + q_seq_idx + 1;
     }
-    first_key = pad + min(int(simd_gid), max(0, key_limit - pad));
+    loop_limit = key_limit;
+    if (match_solo_rows) {
+      loop_limit = row_staged_end(kv_offsets[row], N, int(tpg.y));
+      if (!row_matches_length_range(max(0, loop_limit - pad), row_lengths)) {
+        return;
+      }
+    }
+    first_key = pad + min(int(simd_gid), max(0, loop_limit - pad));
     // A simdgroup without keys must not point past the end of K/V.
     read_start = min(first_key, N - 1);
   }
@@ -115,7 +137,7 @@ template <typename T, int D, int V = D>
 
   // Restrict the keys to the window
   int lo = 0;
-  int hi = key_limit;
+  int hi = loop_limit;
   if (has_window) {
     // Offset = kL - qL = N - tpg.y
     auto range = window_range(N - int(tpg.y) + int(q_seq_idx), N);
@@ -151,7 +173,9 @@ template <typename T, int D, int V = D>
   // For each key in valid range
   for (int i = lo + first_key; i < hi; i += BN) {
     bool use_key = true;
-    if (do_causal && !has_kv_offsets) {
+    if (match_solo_rows) {
+      use_key = i < key_limit;
+    } else if (do_causal && !has_kv_offsets) {
       use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
     }
 
@@ -259,6 +283,8 @@ template <typename T, int D, int V = D, int TK = 4>
     [[buffer(19), function_constant(has_left_padding)]],
     const device int* kv_offsets
     [[buffer(20), function_constant(has_kv_offsets)]],
+    const constant int2& row_lengths
+    [[buffer(21), function_constant(match_solo_rows)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -295,13 +321,23 @@ template <typename T, int D, int V = D, int TK = 4>
   int first_key = block_idx;
   int read_start = block_idx;
   int key_limit = N;
+  int loop_limit = N;
   if (has_left_padding) {
     const int pad = clamp(left_padding[batch_idx], 0, N);
     if (has_kv_offsets) {
       key_limit = clamp(kv_offsets[batch_idx], 0, N - int(q_seq_idx) - 1) +
           int(q_seq_idx) + 1;
     }
-    first_key = pad + min(block_idx, max(0, key_limit - pad));
+    loop_limit = key_limit;
+    if (match_solo_rows) {
+      // Split the unrolled iteration and scalar tail using the staged width,
+      // as the solo kernel does, then apply the query's causal end inside.
+      loop_limit = row_staged_end(kv_offsets[batch_idx], N, q_seq_len);
+      if (!row_matches_length_range(max(0, loop_limit - pad), row_lengths)) {
+        return;
+      }
+    }
+    first_key = pad + min(block_idx, max(0, loop_limit - pad));
     // Empty blocks still write zero partials but must not read any K/V.
     read_start = min(first_key, N - 1);
   }
@@ -381,7 +417,7 @@ template <typename T, int D, int V = D, int TK = 4>
   }
 
   // For each key
-  for (; i + (TK - 1) * blocks < key_limit; i += blocks * TK) {
+  for (; i + (TK - 1) * blocks < loop_limit; i += blocks * TK) {
     // Prefetch: issue all TK K/V loads first so the HW can overlap them.
     T k_reg[TK][qk_per_thread];
     T v_reg[TK][v_per_thread];
@@ -403,6 +439,8 @@ template <typename T, int D, int V = D, int TK = 4>
       bool use_key = true;
       if (has_window) {
         use_key = (ii >= lo) && (ii < hi);
+      } else if (match_solo_rows) {
+        use_key = ii < key_limit;
       } else if (do_causal && !has_kv_offsets) {
         use_key = ii <= (N - q_seq_len + int(q_seq_idx));
       }
@@ -446,10 +484,12 @@ template <typename T, int D, int V = D, int TK = 4>
   }
 
   // Tail (fewer than TK remaining keys)
-  for (; i < key_limit; i += blocks) {
+  for (; i < loop_limit; i += blocks) {
     bool use_key = true;
     if (has_window) {
       use_key = (i >= lo) && (i < hi);
+    } else if (match_solo_rows) {
+      use_key = i < key_limit;
     } else if (do_causal && !has_kv_offsets) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
     }
@@ -658,6 +698,15 @@ template <typename T, int D>
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
     const constant int& blocks [[buffer(4)]],
+    const device int* left_padding
+    [[buffer(5), function_constant(match_solo_rows)]],
+    const device int* kv_offsets
+    [[buffer(6), function_constant(match_solo_rows)]],
+    const constant int& N [[buffer(7), function_constant(match_solo_rows)]],
+    const constant int& num_q_heads
+    [[buffer(8), function_constant(match_solo_rows)]],
+    const constant int2& row_lengths
+    [[buffer(9), function_constant(match_solo_rows)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -673,6 +722,14 @@ template <typename T, int D>
 
   // Adjust positions
   const int head_idx = tid.x;
+  if (match_solo_rows) {
+    const int row = head_idx / num_q_heads;
+    const int pad = clamp(left_padding[row], 0, N);
+    const int staged_end = row_staged_end(kv_offsets[row], N, int(tpg.y));
+    if (!row_matches_length_range(max(0, staged_end - pad), row_lengths)) {
+      return;
+    }
+  }
   const int q_seq_idx = tid.y;
   const int q_offset = head_idx * tpg.y + q_seq_idx;
   partials += q_offset * blocks * D + simd_gid * D + simd_lid * elem_per_thread;

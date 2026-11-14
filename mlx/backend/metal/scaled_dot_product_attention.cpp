@@ -1,5 +1,6 @@
 // Copyright © 2024-26 Apple Inc.
 #include <algorithm>
+#include <array>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -698,6 +699,8 @@ int visible_keys(int N, int qL, int window_size, bool do_causal) {
   return std::min(N, span + qL - 1);
 }
 
+using RowLengthRange = std::array<int, 2>;
+
 bool sdpa_vector(
     const Stream& s,
     metal::Device& d,
@@ -711,7 +714,8 @@ bool sdpa_vector(
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
     const std::optional<array>& left_padding = std::nullopt,
-    const std::optional<array>& kv_offsets = std::nullopt) {
+    const std::optional<array>& kv_offsets = std::nullopt,
+    const std::optional<RowLengthRange>& row_lengths = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -740,6 +744,7 @@ bool sdpa_vector(
   bool has_sinks = sinks.has_value();
   bool has_left_padding = left_padding.has_value();
   bool has_kv_offsets = kv_offsets.has_value();
+  bool match_solo_rows = row_lengths.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -750,6 +755,7 @@ bool sdpa_vector(
       {&window_size, MTL::DataType::DataTypeInt, 27},
       {&has_left_padding, MTL::DataType::DataTypeBool, 28},
       {&has_kv_offsets, MTL::DataType::DataTypeBool, 29},
+      {&match_solo_rows, MTL::DataType::DataTypeBool, 30},
   };
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -762,6 +768,9 @@ bool sdpa_vector(
   }
   if (has_kv_offsets) {
     hash_name += "_row_offsets";
+  }
+  if (match_solo_rows) {
+    hash_name += "_match_solo_rows";
   }
 
   // Get the kernel
@@ -809,6 +818,9 @@ bool sdpa_vector(
   if (has_kv_offsets) {
     compute_encoder.set_input_array(*kv_offsets, 19);
   }
+  if (row_lengths) {
+    compute_encoder.set_bytes(*row_lengths, 20);
+  }
 
   // Launch
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
@@ -828,7 +840,8 @@ void sdpa_vector_2pass(
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
     const std::optional<array>& left_padding = std::nullopt,
-    const std::optional<array>& kv_offsets = std::nullopt) {
+    const std::optional<array>& kv_offsets = std::nullopt,
+    const std::optional<RowLengthRange>& row_lengths = std::nullopt) {
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -857,7 +870,9 @@ void sdpa_vector_2pass(
   char devc = d.get_architecture().back();
   int N = k.shape(2);
   // Choose the blocks from the keys inside the window
-  int n_keys = visible_keys(N, q.shape(2), window_size, do_causal);
+  int n_keys = row_lengths
+      ? (*row_lengths)[0]
+      : visible_keys(N, q.shape(2), window_size, do_causal);
   int blocks;
   if (devc == 's') {
     blocks = 64;
@@ -928,6 +943,7 @@ void sdpa_vector_2pass(
   bool has_sinks = sinks.has_value();
   bool has_left_padding = left_padding.has_value();
   bool has_kv_offsets = kv_offsets.has_value();
+  bool match_solo_rows = row_lengths.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -942,6 +958,7 @@ void sdpa_vector_2pass(
     func_consts.emplace_back(
         &has_left_padding, MTL::DataType::DataTypeBool, 28);
     func_consts.emplace_back(&has_kv_offsets, MTL::DataType::DataTypeBool, 29);
+    func_consts.emplace_back(&match_solo_rows, MTL::DataType::DataTypeBool, 30);
   }
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -956,6 +973,9 @@ void sdpa_vector_2pass(
   }
   if (has_kv_offsets) {
     hash_name += "_row_offsets";
+  }
+  if (match_solo_rows) {
+    hash_name += "_match_solo_rows";
   }
 
   // Get the kernel
@@ -1010,6 +1030,9 @@ void sdpa_vector_2pass(
   if (has_kv_offsets) {
     compute_encoder.set_input_array(*kv_offsets, 20);
   }
+  if (row_lengths) {
+    compute_encoder.set_bytes(*row_lengths, 21);
+  }
 
   // Launch
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
@@ -1022,7 +1045,14 @@ void sdpa_vector_2pass(
   kname += std::to_string(v.shape(-1));
 
   // Get the kernel
-  kernel = d.get_kernel(kname);
+  std::string reduce_hash = kname;
+  if (match_solo_rows) {
+    reduce_hash += "_match_solo_rows";
+  }
+  kernel = d.get_kernel(
+      kname,
+      reduce_hash,
+      {{&match_solo_rows, MTL::DataType::DataTypeBool, 30}});
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
@@ -1031,12 +1061,80 @@ void sdpa_vector_2pass(
   compute_encoder.set_input_array(maxs, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(blocks, 4);
+  if (row_lengths) {
+    compute_encoder.set_input_array(*left_padding, 5);
+    compute_encoder.set_input_array(*kv_offsets, 6);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(q.shape(1), 8);
+    compute_encoder.set_bytes(*row_lengths, 9);
+  }
 
   // Launch
   group_dims = MTL::Size(1024, 1, 1);
   grid_dims = MTL::Size(q.shape(0) * q.shape(1), q.shape(2), 1);
-  check_kernel_threadgroup_size(kernel, group_dims, kname);
+  check_kernel_threadgroup_size(kernel, group_dims, reduce_hash);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void sdpa_vector_match_solo(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out,
+    float scale,
+    bool do_causal,
+    int window_size,
+    const std::optional<array>& left_padding,
+    const std::optional<array>& kv_offsets) {
+  // M5 Max switches from one pass to two at 1024 staged keys per row.
+  const int max_keys = k.shape(2);
+  const bool single_pass = sdpa_vector(
+      s,
+      d,
+      q,
+      k,
+      v,
+      out,
+      scale,
+      do_causal,
+      window_size,
+      std::nullopt,
+      std::nullopt,
+      left_padding,
+      kv_offsets,
+      RowLengthRange{0, 1024});
+
+  auto two_pass = [&](int first, int end) {
+    if (first <= max_keys) {
+      sdpa_vector_2pass(
+          s,
+          d,
+          q,
+          k,
+          v,
+          out,
+          scale,
+          do_causal,
+          window_size,
+          std::nullopt,
+          std::nullopt,
+          left_padding,
+          kv_offsets,
+          RowLengthRange{first, end});
+    }
+  };
+
+  const int first = single_pass ? 1024 : 0;
+  const int n_simds = q.shape(1) / k.shape(1) * q.shape(2);
+  if (n_simds <= 4 || config::get("MLX_SDPA_BLOCKS", 0) > 0) {
+    two_pass(first, max_keys + 1);
+  } else {
+    two_pass(first, 1025);
+    two_pass(1025, 8193);
+    two_pass(8193, 32769);
+  }
 }
 
 void sdpa_split(
@@ -1940,7 +2038,18 @@ void ScaledDotProductAttention::eval_gpu(
     int ws = window_size_;
     int n_keys = visible_keys(k.shape(2), q.shape(2), ws, csl);
     char devc = d.get_architecture().back();
-    if (((devc == 'd' || devc == 's') && n_keys >= 1024) ||
+    int gqa_factor = q.shape(1) / k.shape(1);
+    bool match_solo_rows = kv_offsets && devc == 's' &&
+        d.get_architecture_gen() == 17 && q.dtype() == bfloat16 &&
+        ((q.shape(2) == 4 && gqa_factor == 4) ||
+         (q.shape(2) == 1 && (gqa_factor == 2 || gqa_factor == 4))) &&
+        q.shape(-1) == 128 && v.shape(-1) == 128 && n_keys <= 32768 &&
+        config::get("MLX_SDPA_MATCH_SOLO_ROWS", false);
+    if (match_solo_rows) {
+      sdpa_vector_match_solo(
+          s, d, q, k, v, o, scale_, csl, ws, left_padding, kv_offsets);
+    } else if (
+        ((devc == 'd' || devc == 's') && n_keys >= 1024) ||
         (k.shape(1) < q.shape(1) && n_keys >= 4096)) {
       sdpa_vector_2pass(
           s,
