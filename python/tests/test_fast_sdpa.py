@@ -694,8 +694,90 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 )
             with self.assertRaisesRegex(ValueError, "cannot be combined"):
                 mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=0.5, mask="causal", left_padding=pads
+                    q, k, v, scale=0.5, mask=mask, left_padding=pads
                 )
+
+    def check_sdpa_causal_left_padding(self, stream, n, query_length, dtype, heads):
+        # Zero queries and keys give uniform attention over the visible keys.
+        # The large final value separates the final query, the only one that
+        # may see the last key, from earlier queries.
+        n_heads, n_kv_heads, dim = heads
+        # The last row keeps exactly as many keys as queries, so its earliest
+        # query sees a single key.
+        pads = mx.array([0, n // 3, n - query_length], dtype=mx.int32)
+        q = mx.zeros((3, n_heads, query_length, dim), dtype=dtype)
+        k = mx.zeros((3, n_kv_heads, n, dim), dtype=dtype)
+        positions = mx.arange(n)
+        values = mx.where(positions == n - 1, 16.0, 1.0).astype(dtype)
+        v = mx.broadcast_to(values[None, None, :, None], k.shape)
+        mask = (positions >= pads[:, None, None, None]) & make_causal_mask(
+            query_length, n
+        )
+        scale = dim**-0.5
+        padded = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask="causal", left_padding=pads, stream=stream
+        )
+        explicit = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask, stream=stream
+        )
+        msg = f"{dtype} keys {n} queries {query_length} heads {heads}"
+        self.assertTrue(
+            mx.allclose(padded, explicit, rtol=2e-3, atol=2e-3).item(), msg
+        )
+        final_query = 1.0 + 15.0 / (n - pads)
+        self.assertTrue(
+            mx.allclose(padded[:, :, -1, :], final_query[:, None, None], rtol=1e-2)
+            .item(),
+            msg,
+        )
+        if query_length > 1:
+            self.assertTrue(
+                mx.allclose(padded[:, :, :-1, :], mx.array(1.0), atol=1e-2).item(),
+                msg,
+            )
+        return padded, q, k, v, pads
+
+    def test_sdpa_causal_left_padding_cpu(self):
+        for query_length in (1, 3, 9):
+            with self.subTest(query_length=query_length), mx.stream(mx.cpu):
+                self.check_sdpa_causal_left_padding(
+                    mx.cpu, 17, query_length, mx.float32, (4, 1, 64)
+                )
+        q = mx.ones((1, 1, 3, 4))
+        kv = mx.ones((1, 1, 2, 4))
+        with self.assertRaisesRegex(ValueError, "at least as many valid keys"):
+            mx.fast.scaled_dot_product_attention(
+                q, kv, kv, scale=0.5, mask="causal", left_padding=mx.array([0])
+            )
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "requires a GPU")
+    def test_sdpa_causal_left_padding_gpu(self):
+        # 257 keys use the single-pass vector kernel and 4,200 keys the
+        # two-pass kernel; 9 queries use the mask fallback.
+        for n, query_length, dtype, heads in product(
+            (257, 4200),
+            (1, 2, 8, 9),
+            (mx.float32, mx.bfloat16),
+            ((4, 1, 64), (32, 8, 128)),
+        ):
+            if heads[0] // heads[1] * query_length > 32:
+                continue
+            with self.subTest(n=n, query_length=query_length, dtype=dtype):
+                padded, q, k, v, pads = self.check_sdpa_causal_left_padding(
+                    mx.gpu, n, query_length, dtype, heads
+                )
+                if query_length <= 8 and mx.metal.is_available():
+                    # The default dispatch uses the vector kernel.
+                    fused = mx.fast.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        scale=heads[2] ** -0.5,
+                        mask="causal",
+                        left_padding=pads,
+                        force_fused=True,
+                    )
+                    self.assertTrue(mx.array_equal(padded, fused).item())
 
     @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_sdpa_vector_left_padding_shapes(self):

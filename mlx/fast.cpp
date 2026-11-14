@@ -739,6 +739,9 @@ static array scaled_dot_product_attention_impl(
     throw std::invalid_argument(msg.str());
   }
   bool has_window = window_size > 0;
+  // Padding hides keys on the left and causality hides later queries' keys
+  // on the right, so the two combine without conflict.
+  const bool causal_with_left_padding = left_padding && mask_mode == "causal";
 
   if (left_padding) {
     if (detail::in_dynamic_tracing()) {
@@ -746,10 +749,11 @@ static array scaled_dot_product_attention_impl(
           "[scaled_dot_product_attention] left_padding does not support "
           "shapeless tracing.");
     }
-    if (!mask_mode.empty() || mask_arr || has_window || sinks) {
+    if ((!mask_mode.empty() && !causal_with_left_padding) || mask_arr ||
+        has_window || sinks) {
       throw std::invalid_argument(
           "[scaled_dot_product_attention] left_padding cannot be combined "
-          "with a mask, window, or sinks.");
+          "with an array mask, window, or sinks.");
     }
     if (left_padding->dtype() != int32 ||
         left_padding->shape() != Shape{queries.shape(0)}) {
@@ -761,6 +765,11 @@ static array scaled_dot_product_attention_impl(
       throw std::invalid_argument(
           "[scaled_dot_product_attention] left_padding requires nonempty "
           "keys and values with matching sequence lengths.");
+    }
+    if (causal_with_left_padding && queries.shape(2) > keys.shape(2)) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] causal left_padding requires at "
+          "least as many valid keys as queries in every row.");
     }
     mask_arr = greater_equal(
         arange(keys.shape(2), s),
@@ -781,7 +790,7 @@ static array scaled_dot_product_attention_impl(
   bool has_arr_mask = false;
   bool has_bool_mask = false;
 
-  if (mask_mode == "causal") {
+  if (mask_mode == "causal" && !causal_with_left_padding) {
     has_mask = true;
     do_causal = true;
 
@@ -855,10 +864,31 @@ static array scaled_dot_product_attention_impl(
   auto k = astype(keys, final_type, s);
   auto v = astype(values, final_type, s);
 
+  auto stream = to_stream(s);
+  bool is_training = detail::in_grad_tracing();
+  // The Metal vector kernels (queries of up to 8 tokens) start each row at
+  // its first valid key instead of testing a mask for every key, and apply
+  // the causal boundary themselves. Other paths and backends use the mask.
+  const bool skip_left_padding = left_padding && !is_training &&
+      !detail::in_export_tracing() && stream.device == Device::gpu &&
+      metal::is_available() && q.shape(2) <= 8;
+  if (causal_with_left_padding && !skip_left_padding && q.shape(2) > 1) {
+    // Lower-right causal alignment, as for mask="causal".
+    const int kL = k.shape(2);
+    const auto q_pos =
+        expand_dims(arange(kL - q.shape(2), kL, stream), 1, stream);
+    const auto causal_mask = greater_equal(q_pos, arange(kL, stream), stream);
+    mask_arr = logical_and(*mask_arr, causal_mask, stream);
+  }
+  // On the vector path the compact padding mask stays an operand for graph
+  // transforms, and the fallback applies causality on top of it.
+  const bool fused_causal =
+      do_causal || (causal_with_left_padding && skip_left_padding);
+
   auto fallback = [scale,
                    n_q_heads,
                    n_kv_heads,
-                   do_causal,
+                   do_causal = fused_causal,
                    window_size,
                    has_sinks,
                    has_arr_mask,
@@ -955,7 +985,6 @@ static array scaled_dot_product_attention_impl(
     return std::vector<array>{out};
   };
 
-  auto stream = to_stream(s);
   std::vector<array> inputs = {q, k, v};
   if (has_arr_mask) {
     // Check type
@@ -989,7 +1018,6 @@ static array scaled_dot_product_attention_impl(
     inputs.push_back(astype(*sinks, final_type, stream));
   }
 
-  bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
   bool output_logsumexp = is_training && has_fast_vjp;
   if (!ScaledDotProductAttention::use_fallback(
@@ -1015,12 +1043,6 @@ static array scaled_dot_product_attention_impl(
           full_like(mask, -inf, final_type, stream),
           stream);
     }
-    // The Metal vector kernels (queries of up to 8 tokens) start each row at
-    // its first valid key instead of testing a mask for every key. Other
-    // paths and backends use the mask built above.
-    const bool skip_left_padding = left_padding && !is_training &&
-        !detail::in_export_tracing() && stream.device == Device::gpu &&
-        metal::is_available() && q.shape(2) <= 8;
     if (skip_left_padding) {
       // Keep the mask operand for graph transforms using the fallback.
       inputs.push_back(contiguous(*left_padding, false, stream));
@@ -1030,7 +1052,7 @@ static array scaled_dot_product_attention_impl(
         stream,
         fallback,
         scale,
-        do_causal,
+        fused_causal,
         has_sinks,
         window_size,
         output_logsumexp,
