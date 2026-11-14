@@ -1808,8 +1808,8 @@ void ScaledDotProductAttention::eval_gpu(
   // Only the vector kernels receive it; it still counts as an array mask so
   // the split kernel, which ignores masks, is never chosen.
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
-  auto left_padding = has_left_padding_ ? std::optional<array>{inputs[3]}
-                                        : std::nullopt;
+  auto left_padding =
+      has_left_padding_ ? std::optional<array>{inputs[3]} : std::nullopt;
 
   auto set_transposed_output = [&o]() {
     int64_t str_oD = 1;
