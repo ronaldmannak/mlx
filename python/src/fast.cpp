@@ -267,9 +267,30 @@ void init_fast(nb::module_& parent_module) {
          const std::optional<mx::array>& sinks,
          bool force_fused,
          const std::optional<mx::array>& left_padding,
+         const std::optional<mx::array>& kv_offsets,
          mx::StreamOrDevice s) {
         auto attend = [&](const std::string& mask_mode,
                           const std::optional<mx::array>& mask_arr) {
+          if (kv_offsets) {
+            if (!left_padding) {
+              throw std::invalid_argument(
+                  "[scaled_dot_product_attention] kv_offsets requires causal "
+                  "masking and left_padding.");
+            }
+            return mx::fast::scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale,
+                window_size,
+                mask_mode,
+                mask_arr,
+                sinks,
+                force_fused,
+                *left_padding,
+                *kv_offsets,
+                s);
+          }
           if (left_padding) {
             return mx::fast::scaled_dot_product_attention(
                 queries,
@@ -331,9 +352,10 @@ void init_fast(nb::module_& parent_module) {
       "sinks"_a = nb::none(),
       "force_fused"_a = false,
       "left_padding"_a = nb::none(),
+      "kv_offsets"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, left_padding: array | None = None, stream: StreamOrDevice = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, left_padding: array | None = None, kv_offsets: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -387,6 +409,13 @@ void init_fast(nb::module_& parent_module) {
                tracing. On Metal, eligible shapes with up to 8 queries skip
                the padded positions without reading them. Other cases apply
                a boolean mask built from the counts.
+            kv_offsets (array, optional): An int32 array of shape ``[B]``
+               containing each row's physical KV cursor before the query block.
+               Requires ``mask="causal"`` and ``left_padding``. Query ``j``
+               attends to keys from ``left_padding[b]`` through
+               ``kv_offsets[b] + j``, inclusive. Each cursor must be at
+               least its row's left-padding count and no greater than
+               ``T_kv - T_q``. Cursor values are not checked.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
             force_fused (bool, optional): If ``True``, use a fused kernel
