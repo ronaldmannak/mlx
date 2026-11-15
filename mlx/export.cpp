@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 #include "mlx/export.h"
 #include <map>
+#include "mlx/backend/metal/metal.h"
 #include "mlx/compile_impl.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/graph_utils.h"
@@ -319,20 +320,20 @@ std::vector<StateT> primitive_state(const Primitive& p) {
   return state;
 }
 
-template <typename T>
+template <typename T, auto... ExtraArgs>
 std::shared_ptr<T> deserialize_primitive(Reader& is, Stream s) {
   if constexpr (has_state<T>) {
     auto args = deserialize<decltype(std::declval<T>().state())>(is);
     if constexpr (is_pair<decltype(args)> || is_tuple<decltype(args)>) {
       auto fn = [s](auto&&... args) {
-        return std::make_shared<T>(s, std::move(args)...);
+        return std::make_shared<T>(s, std::move(args)..., ExtraArgs...);
       };
       return std::apply(fn, std::move(args));
     } else {
-      return std::make_shared<T>(s, std::move(args));
+      return std::make_shared<T>(s, std::move(args), ExtraArgs...);
     }
   } else {
-    return std::make_shared<T>(s);
+    return std::make_shared<T>(s, ExtraArgs...);
   }
 }
 
@@ -466,6 +467,11 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(LayerNormVJP),
       SERIALIZE_PRIMITIVE(RoPE),
       SERIALIZE_PRIMITIVE(ScaledDotProductAttention),
+      // A separate name preserves the state layout of existing SDPA files.
+      {ScaledDotProductAttention::left_padding_name,
+       {serialize_primitive<ScaledDotProductAttention>,
+        deserialize_primitive<ScaledDotProductAttention, true>,
+        primitive_state<ScaledDotProductAttention>}},
       SERIALIZE_PRIMITIVE(CustomKernel)};
   std::unordered_map<std::string, std::string> name_remap;
   std::unordered_map<int, Stream> stream_map;
@@ -512,10 +518,15 @@ struct PrimitiveFactory {
   }
 
   std::shared_ptr<Primitive> load(Reader& is) {
-    auto stream = resolve_stream(deserialize<Stream>(is));
+    auto stream = deserialize<Stream>(is);
     auto name = deserialize<std::string>(is);
+    if (name == ScaledDotProductAttention::left_padding_name &&
+        (stream.device != Device::gpu || !metal::is_available())) {
+      throw std::invalid_argument(
+          "[import_function] Captured left-padded attention requires a Metal GPU.");
+    }
     if (auto it = factory.find(name); it != factory.end()) {
-      return it->second.deserialize(is, stream);
+      return it->second.deserialize(is, resolve_stream(stream));
     } else {
       throw std::invalid_argument(
           "[import_function] Unable to deserialize primitive " + name);

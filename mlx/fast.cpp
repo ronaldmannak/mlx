@@ -999,7 +999,7 @@ static array scaled_dot_product_attention_impl(
   if (skip_left_padding) {
     // The vector kernels read the counts directly, and the fallback rebuilds
     // the mask from them, so the mask is never materialized on this path.
-    inputs.push_back(contiguous(*left_padding, false, stream));
+    inputs.push_back(*left_padding);
   } else if (has_arr_mask) {
     // Check type
     has_bool_mask = mask_arr->dtype() == bool_;

@@ -745,6 +745,23 @@ class TestExportImport(mlx_tests.MLXTestCase):
         (imported,) = mx.import_function(path)()
         self.assertTrue(mx.array_equal(imported, constant).item())
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_export_captured_left_padded_sdpa(self):
+        with mx.stream(mx.gpu):
+            q = mx.zeros((2, 4, 4, 64))
+            k = mx.zeros((2, 1, 257, 64))
+            v = mx.arange(k.size, dtype=mx.float32).reshape(k.shape)
+            pads = mx.array([0, 11, 37, 13], dtype=mx.int32)[::2]
+            mx.eval(q, k, v, pads)
+            attention = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=0.125, mask="causal", left_padding=pads
+            )
+
+        path = os.path.join(self.test_dir, "captured_attention.mlxfn")
+        mx.export_function(path, lambda: attention)
+        (imported,) = mx.import_function(path)()
+        self.assertTrue(mx.array_equal(imported, attention).item())
+
     def test_export_import_scatter_sum(self):
         def fun(x, y, z):
             return x.at[y].add(z)
