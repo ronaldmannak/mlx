@@ -4,6 +4,7 @@
 #include "mlx/compile_impl.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/graph_utils.h"
+#include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms_impl.h"
 #include "mlx/utils.h"
@@ -900,7 +901,13 @@ void FunctionExporter::export_function(const Args& args, const Kwargs& kwargs) {
         if (constants.insert({arr.id(), arr}).second) {
           serialize(os, arr.shape());
           serialize(os, arr.dtype());
-          os.write(arr.data<char>(), arr.nbytes());
+          // The file stores values in row-major order without strides.
+          auto packed = arr;
+          if (!arr.flags().row_contiguous) {
+            packed = contiguous(arr);
+            packed.eval();
+          }
+          os.write(packed.data<char>(), packed.nbytes());
         }
       } else {
         serialize(os, false);
