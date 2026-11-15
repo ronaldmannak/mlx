@@ -782,7 +782,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             (mx.float32, mx.bfloat16),
             ((4, 1, 64), (32, 8, 128)),
         ):
-            if heads[0] // heads[1] * query_length > 32:
+            if query_length <= 8 and heads[0] // heads[1] * query_length > 32:
                 continue
             with self.subTest(n=n, query_length=query_length, dtype=dtype):
                 padded, q, k, v, pads = self.check_sdpa_causal_left_padding(
