@@ -317,7 +317,11 @@ class ScaledDotProductAttention : public Custom {
 
   bool is_equivalent(const Primitive& other) const override;
 
-  DEFINE_NAME(ScaledDotProductAttention);
+  static constexpr const char* left_padding_name =
+      "ScaledDotProductAttentionWithLeftPadding";
+  const char* name() const override {
+    return has_left_padding_ ? left_padding_name : "ScaledDotProductAttention";
+  }
   DEFINE_INPUT_OUTPUT_SHAPE()
   auto state() const {
     return std::make_tuple(
