@@ -114,6 +114,17 @@ Metal
    Enable the faster Metal CPU/GPU synchronization path. The default is ``0``.
    This requires Metal 3.2 or later (macOS 15 or later, or iOS 18 or later).
 
+.. envvar:: MLX_QUANTIZED_MATMUL_MATCH_SINGLE_ROW
+
+   Set to ``1`` to match single-row Metal results in
+   :func:`mlx.core.quantized_matmul` with affine quantization and
+   ``transpose=True``. For eligible aligned 4-bit BF16 and FP16 projections,
+   the vector kernel shares packed weight loads across two activation rows
+   while keeping each row's reduction order. The default is ``0``. Exact
+   mode can reduce throughput for wide batches and prompt prefill. For
+   decode-only use, scope the setting to evaluation of the decode operations
+   with :func:`mlx.core.config.scoped_update`.
+
 .. envvar:: MLX_CONV_WINOGRAD
 
    Allow the Winograd algorithm for 3x3 ``conv2d``. The default is ``1``. Set

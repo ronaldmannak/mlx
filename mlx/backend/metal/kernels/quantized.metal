@@ -248,4 +248,16 @@
 instantiate_quantized_all_groups(float)
 instantiate_quantized_all_groups(float16_t)
 instantiate_quantized_all_groups(bfloat16_t)
+
+#define instantiate_qmv_fast_pair(type, aligned_m) \
+  instantiate_kernel( \
+      "affine_qmv_fast_pair_" #type "_alM_" #aligned_m, \
+      affine_qmv_fast_pair, \
+      type, \
+      aligned_m)
+
+instantiate_qmv_fast_pair(float16_t, 0)
+instantiate_qmv_fast_pair(float16_t, 1)
+instantiate_qmv_fast_pair(bfloat16_t, 0)
+instantiate_qmv_fast_pair(bfloat16_t, 1)
 // clang-format on
