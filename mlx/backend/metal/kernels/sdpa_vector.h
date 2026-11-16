@@ -14,6 +14,8 @@ constant int blocks [[function_constant(26)]];
 constant int window_size [[function_constant(27)]];
 constant bool has_left_padding [[function_constant(28)]];
 constant bool has_kv_offsets [[function_constant(29)]];
+// Split the rows by unpadded length for single-pass and two-pass attention.
+constant bool filter_rows [[function_constant(30)]];
 constant bool has_window = window_size > 0;
 constant bool has_row_heads = has_sinks || has_left_padding;
 
@@ -53,6 +55,8 @@ template <typename T, int D, int V = D>
     [[buffer(18), function_constant(has_left_padding)]],
     const device int* kv_offsets
     [[buffer(19), function_constant(has_kv_offsets)]],
+    const constant int& two_pass_min_keys
+    [[buffer(20), function_constant(filter_rows)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -87,6 +91,10 @@ template <typename T, int D, int V = D>
   if (has_left_padding) {
     const int row = q_batch_head_idx / num_q_heads;
     const int pad = clamp(left_padding[row], 0, N);
+    // Rows that would use the two-pass kernel alone are left to it.
+    if (filter_rows && N - pad >= two_pass_min_keys) {
+      return;
+    }
     if (has_kv_offsets) {
       key_limit = clamp(kv_offsets[row], 0, N - q_seq_idx - 1) + q_seq_idx + 1;
     }
@@ -259,6 +267,8 @@ template <typename T, int D, int V = D, int TK = 4>
     [[buffer(19), function_constant(has_left_padding)]],
     const device int* kv_offsets
     [[buffer(20), function_constant(has_kv_offsets)]],
+    const constant int& two_pass_min_keys
+    [[buffer(21), function_constant(filter_rows)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -297,6 +307,10 @@ template <typename T, int D, int V = D, int TK = 4>
   int key_limit = N;
   if (has_left_padding) {
     const int pad = clamp(left_padding[batch_idx], 0, N);
+    // Rows that would use the single-pass kernel alone are left to it.
+    if (filter_rows && N - pad < two_pass_min_keys) {
+      return;
+    }
     if (has_kv_offsets) {
       key_limit = clamp(kv_offsets[batch_idx], 0, N - int(q_seq_idx) - 1) +
           int(q_seq_idx) + 1;
@@ -658,6 +672,13 @@ template <typename T, int D>
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
     const constant int& blocks [[buffer(4)]],
+    const device int* left_padding
+    [[buffer(5), function_constant(filter_rows)]],
+    const constant int& N [[buffer(6), function_constant(filter_rows)]],
+    const constant int& num_q_heads
+    [[buffer(7), function_constant(filter_rows)]],
+    const constant int& two_pass_min_keys
+    [[buffer(8), function_constant(filter_rows)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -673,6 +694,14 @@ template <typename T, int D>
 
   // Adjust positions
   const int head_idx = tid.x;
+  // The single-pass kernel already wrote the rows it handled, and the first
+  // pass left their partials unwritten.
+  if (filter_rows) {
+    const int pad = clamp(left_padding[head_idx / num_q_heads], 0, N);
+    if (N - pad < two_pass_min_keys) {
+      return;
+    }
+  }
   const int q_seq_idx = tid.y;
   const int q_offset = head_idx * tpg.y + q_seq_idx;
   partials += q_offset * blocks * D + simd_gid * D + simd_lid * elem_per_thread;

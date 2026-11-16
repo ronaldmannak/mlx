@@ -677,6 +677,60 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             self.assertTrue(mx.array_equal(padded, solo).item())
 
     @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+    def test_sdpa_vector_left_padding_uses_each_rows_unpadded_length(self):
+        # Rows on both sides of the 1,024-key and 4,096-key two-pass cutoffs
+        # share one padded batch, so each row must take the kernel its
+        # unpadded length gets alone. A batch below both cutoffs checks the
+        # single-pass kernel by itself.
+        def attend(q, k, v, **kwargs):
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=128**-0.5, **kwargs
+            )
+
+        with mx.stream(mx.gpu):
+            for length, unpadded in [
+                (4245, [1023, 1024, 4095, 4096]),
+                (1023, [922, 1023]),
+            ]:
+                with self.subTest(length=length):
+                    rows = len(unpadded)
+                    q_shape = (rows, 32, 1, 128)
+                    kv_shape = (rows, 8, length, 128)
+                    pads = [length - n for n in unpadded]
+                    if length == 1023:
+                        # Uniform scores and cancelling values expose a
+                        # rotation of the single-pass partials.
+                        q = mx.zeros(q_shape, dtype=mx.bfloat16)
+                        k = mx.zeros(kv_shape, dtype=mx.bfloat16)
+                        positions = mx.arange(length)
+                        # Three logical indices in different simdgroups.
+                        offsets = mx.array(pads)[:, None]
+                        values = mx.where(positions == offsets + 13, 2**27, 0)
+                        values -= mx.where(positions == offsets + 5, 2**27, 0)
+                        values += positions == offsets + 23
+                        v = mx.broadcast_to(
+                            values[:, None, :, None].astype(mx.bfloat16), k.shape
+                        )
+                    else:
+                        qk, kk, vk = mx.random.split(mx.random.key(172), 3)
+                        q = mx.random.normal(q_shape, key=qk).astype(mx.bfloat16)
+                        k = mx.random.normal(kv_shape, key=kk).astype(mx.bfloat16)
+                        v = mx.random.normal(kv_shape, key=vk).astype(mx.bfloat16)
+
+                    padded = attend(q, k, v, left_padding=mx.array(pads))
+                    solo = mx.concatenate(
+                        [
+                            attend(
+                                q[row : row + 1],
+                                k[row : row + 1, :, pad:],
+                                v[row : row + 1, :, pad:],
+                            )
+                            for row, pad in enumerate(pads)
+                        ]
+                    )
+                    self.assertTrue(mx.array_equal(padded, solo).item())
+
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_sdpa_left_padding_vmap(self):
         # vmap runs the primitive's fallback, which rebuilds the padding mask
         # from the counts the vector path keeps as its only mask operand.
