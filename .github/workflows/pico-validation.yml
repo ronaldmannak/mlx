@@ -1,0 +1,37 @@
+name: Pico integration validation
+
+on:
+  pull_request:
+  push:
+    branches: [pico/integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pico-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-cpu:
+    if: github.repository == 'ronaldmannak/mlx' || github.repository == 'PicoMLX/mlx'
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      CMAKE_ARGS: -DMLX_BUILD_METAL=OFF -DMLX_BUILD_TESTS=ON -DMLX_BUILD_EXAMPLES=OFF
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      DEVICE: cpu
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Build the current native sources and Python bridge
+        run: python -m pip install -e . numpy pytest
+      - name: Run native C++ tests
+        run: ./build/*/mlx.core/tests/tests
+      - name: Verify row-aware attention and partitioning
+        run: |
+          python -m pytest -q python/tests/test_fast_sdpa.py -k 'left_padding or kv_offsets'
+          python -m pytest -q python/tests/test_ops.py -k argpartition
