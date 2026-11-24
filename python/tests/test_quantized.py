@@ -413,6 +413,29 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y_q.shape, y_hat.shape)
                 self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
+    def test_qqmm_nvfp4_global_scale_float16_cpu(self):
+        with mx.stream(mx.cpu):
+            x = mx.full((1, 128), 1024, dtype=mx.float16)
+            global_scale_x = mx.max(mx.abs(x)).astype(mx.float32)
+            for sign in (1, -1):
+                with self.subTest(sign=sign):
+                    # Encode in float32 to isolate the half-precision matmul.
+                    w = mx.full((1, 128), sign * 2**-23, dtype=mx.float32)
+                    global_scale_w = mx.max(mx.abs(w)).astype(mx.float32)
+                    w_q, scales = mx.quantize(
+                        w, mode="nvfp4", global_scale=global_scale_w
+                    )
+                    result = mx.qqmm(
+                        x,
+                        w_q,
+                        scales,
+                        mode="nvfp4",
+                        global_scale_x=global_scale_x,
+                        global_scale_w=global_scale_w,
+                    )
+                    self.assertEqual(result.dtype, mx.float16)
+                    self.assertEqual(result.item(), sign * 0.015625)
+
     def test_qqmm(self):
         tol = 5e-2 if mx.cuda.is_available() else 1e-3
         key = mx.random.key(0)

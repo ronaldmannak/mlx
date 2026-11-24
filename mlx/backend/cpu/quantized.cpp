@@ -615,8 +615,8 @@ void fp_qmm_t_simd(
       simd::Simd<float, S> acc(0);
       auto x_local = x;
       for (int k = 0; k < K; k += group_size) {
-        T scale =
-            dequantize_scale<T, group_size>(*scales_local++) * inv_scale_enc;
+        float scale = dequantize_scale<float, group_size>(*scales_local++) *
+            inv_scale_enc;
 
         simd::Simd<float, S> g_acc(0);
         for (int kw = 0; kw < packs_in_group; kw += packs_per_simd) {

@@ -42,3 +42,4 @@ jobs:
         run: |
           python -m pytest -q python/tests/test_fast_sdpa.py -k 'left_padding or kv_offsets'
           python -m pytest -q python/tests/test_ops.py -k argpartition
+          python -m pytest -q python/tests/test_quantized.py -k nvfp4_global_scale_float16_cpu
