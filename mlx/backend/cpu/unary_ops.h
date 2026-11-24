@@ -184,7 +184,13 @@ struct FromFP8 {
     auto sign_bit = Simd<uint16_t, N>((x >> 7) & 1) << 15;
     auto u = (v << 7) | (((v + 1) >> 7) << 14) | sign_bit;
     Simd<float, N> out;
-    if constexpr (simd::max_size<float16_t> >= N) {
+#if defined(MLX_SIMD_LIBRARY_VERSION) && MLX_SIMD_LIBRARY_VERSION < 6
+    // The legacy NEON FP16 specialization only provides eight-lane vectors.
+    constexpr bool has_fp16_simd = N == 1 || N == simd::max_size<float16_t>;
+#else
+    constexpr bool has_fp16_simd = N <= simd::max_size<float16_t>;
+#endif
+    if constexpr (has_fp16_simd) {
       auto converted = *(Simd<float16_t, N>*)(&u);
       out = converted * 256.0;
     } else {

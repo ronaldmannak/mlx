@@ -4892,6 +4892,28 @@ TEST_CASE("test fp8 conversion") {
   CHECK(array_equal(out, expected, true).item<bool>());
 }
 
+TEST_CASE("test fp8 to float64 all encodings on cpu") {
+  auto codes = arange(0, 256, uint8, Device::cpu);
+  auto result = from_fp8(codes, float64, Device::cpu);
+  result.eval();
+  auto values = result.data<double>();
+  for (int code = 0; code < 256; ++code) {
+    CAPTURE(code);
+    int exponent = (code >> 3) & 15;
+    int mantissa = code & 7;
+    if (exponent == 15 && mantissa == 7) {
+      CHECK(std::isnan(values[code]));
+      continue;
+    }
+    double magnitude = exponent == 0
+        ? std::ldexp(static_cast<double>(mantissa), -9)
+        : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
+    CHECK_EQ(values[code], (code & 128) ? -magnitude : magnitude);
+  }
+  CHECK_FALSE(std::signbit(values[0]));
+  CHECK(std::signbit(values[128]));
+}
+
 TEST_CASE("test max min with nan") {
   // Test maximum and minimum with NaN values
   auto x = array({0.0f, 1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});

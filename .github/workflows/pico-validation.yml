@@ -32,6 +32,7 @@ jobs:
       - name: Build native C++ tests in a persistent directory
         run: |
           cmake -S . -B build/pico-cpu -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DMLX_BUILD_METAL=OFF -DMLX_BUILD_TESTS=ON \
             -DMLX_BUILD_EXAMPLES=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF
           cmake --build build/pico-cpu --target tests --parallel 3
