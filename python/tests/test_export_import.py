@@ -737,13 +737,19 @@ class TestExportImport(mlx_tests.MLXTestCase):
             self.assertEqual(imported(y)[0].item(), fun(y).item())
 
     def test_export_import_strided_constant(self):
-        path = os.path.join(self.test_dir, "strided_constant.mlxfn")
-        constant = mx.arange(8)[::2]
-        mx.eval(constant)
+        constants = {
+            "strided": mx.arange(8)[::2],
+            "broadcast": mx.broadcast_to(mx.array([7]), (6,)),
+            "transposed": mx.arange(6).reshape(2, 3).T,
+        }
+        for name, constant in constants.items():
+            with self.subTest(name=name):
+                path = os.path.join(self.test_dir, f"{name}_constant.mlxfn")
+                mx.eval(constant)
 
-        mx.export_function(path, lambda: constant)
-        (imported,) = mx.import_function(path)()
-        self.assertTrue(mx.array_equal(imported, constant).item())
+                mx.export_function(path, lambda: constant)
+                (imported,) = mx.import_function(path)()
+                self.assertTrue(mx.array_equal(imported, constant).item())
 
     def test_export_import_scatter_sum(self):
         def fun(x, y, z):
